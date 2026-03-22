@@ -4,8 +4,6 @@ Use your Claude Pro/Max subscription in [OpenCode](https://opencode.ai). If you'
 
 ## Install
 
-**npm:**
-
 ```bash
 npm install -g opencode-claude-bridge
 ```
@@ -14,9 +12,11 @@ Add to `~/.config/opencode/opencode.json`:
 
 ```json
 {
-  "plugins": ["opencode-claude-bridge"]
+  "plugin": ["opencode-claude-bridge"]
 }
 ```
+
+Select an Anthropic model, choose **Claude Pro/Max** when prompted, and you're in.
 
 **From source:**
 
@@ -27,30 +27,19 @@ cd ~/opencode-claude-bridge && npm install && npm run build
 
 ```json
 {
-  "plugins": ["~/opencode-claude-bridge/dist/index.js"]
+  "plugin": ["~/opencode-claude-bridge/dist/index.js"]
 }
 ```
 
-Then select an Anthropic model, choose **Claude Pro/Max** when prompted, and you're in.
-
 ## How the bridge works
 
-```
-┌─────────────┐      ┌───────────────────────┐      ┌─────────────────┐
-│   OpenCode   │─────▶│  opencode-claude-bridge │─────▶│  Anthropic API  │
-└─────────────┘      └───────────────────────┘      └─────────────────┘
-                              │
-                     1. Reads OAuth tokens from
-                        Claude CLI (macOS Keychain
-                        or ~/.claude/.credentials.json)
-                     2. Transforms requests to match
-                        Claude Code's exact format
-                     3. Auto-refreshes expired tokens
-```
+The plugin sits between OpenCode and the Anthropic API:
 
-**Authentication** — On load, the plugin reads your Claude CLI's OAuth tokens directly from macOS Keychain. No browser flow needed. If Claude CLI isn't available, it falls back to a standard browser-based OAuth PKCE flow.
+> **OpenCode** → **opencode-claude-bridge** → **Anthropic API**
 
-**Token refresh** — When tokens expire, three layers are tried in order: re-read from Keychain, refresh via stored token, refresh via CLI's token. On 429 rate limits, the token is refreshed and the request retried (up to 3 times).
+**Authentication** — On load, the plugin reads your Claude CLI's OAuth tokens from macOS Keychain (or `~/.claude/.credentials.json` on Linux). No browser flow needed. If Claude CLI isn't available, it falls back to browser-based OAuth PKCE.
+
+**Token refresh** — When tokens expire, three layers are tried in order: re-read from Keychain, refresh via stored token, refresh via CLI's token. On 429 rate limits, the token is refreshed and the request retried (up to 3 attempts).
 
 **Request transformation** — Every outbound request is rewritten to match what Claude Code 2.1.81 actually sends: correct `user-agent`, `anthropic-beta` flags, `anthropic-version`, Stainless SDK headers, `?beta=true` URL parameter, `mcp_` tool name prefixing, and system prompt sanitization.
 

@@ -1,6 +1,6 @@
 {
   "name": "opencode-claude-bridge",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "OpenCode ↔ Claude bridge — keychain sync + PKCE OAuth + request transformation",
   "type": "module",
   "main": "dist/index.js",
