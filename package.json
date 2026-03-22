@@ -1,0 +1,28 @@
+{
+  "name": "opencode-claude-bridge",
+  "version": "1.0.0",
+  "description": "OpenCode ↔ Claude bridge — keychain sync + PKCE OAuth + request transformation",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "opencode",
+    "anthropic",
+    "oauth",
+    "claude"
+  ],
+  "author": "dotCipher",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "typescript": "^5.9.3"
+  }
+}
