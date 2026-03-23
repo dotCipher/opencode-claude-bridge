@@ -355,7 +355,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
 
       methods: [
         {
-          label: "Claude Pro/Max",
+          label: "Claude Pro / Max (OAuth)",
           type: "oauth" as const,
           authorize: async () => {
             const tokens = getClaudeTokens();
@@ -366,14 +366,13 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             const { url, verifier } = createAuthorizationRequest();
             return {
               url,
-              instructions: "Open the URL above, complete login, then paste the authorization code: ",
+              instructions: "A browser window will open — log in to Claude, then paste the authorization code below:",
               method: "code" as const,
               callback: async (code: string) => {
                 try {
                   const tokens = exchangeCodeForTokens(parseAuthCode(code), verifier);
                   return { type: "success" as const, ...tokens };
-                } catch (err) {
-                  console.error(`[opencode-oauth] Token exchange failed: ${err}`);
+                } catch {
                   return { type: "failed" as const };
                 }
               },
@@ -382,7 +381,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
         },
         {
           provider: "anthropic",
-          label: "Manually enter API Key",
+          label: "API Key",
           type: "api" as const,
         },
       ],
