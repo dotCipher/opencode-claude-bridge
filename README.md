@@ -63,6 +63,22 @@ The plugin sits between OpenCode and the Anthropic API:
 | `ANTHROPIC_CLI_VERSION` | Auto-detected from `claude --version` |
 | `ANTHROPIC_BETA_FLAGS` | Matches Claude Code 2.1.81 |
 
+## Updating for new Claude CLI versions
+
+When Claude Code updates, the required headers or body fields may change. To capture exactly what the latest Claude CLI sends:
+
+```bash
+./scripts/intercept-claude.sh claude-sonnet-4-6
+```
+
+This starts a local proxy, runs Claude CLI through it with OAuth, and saves the full request headers and body to `/tmp/claude-intercept-*`. Compare against the plugin's constants and fetch wrapper to spot differences.
+
+Key things that have changed across versions:
+- `anthropic-beta` flags (required set changes)
+- Body fields (`thinking`, `metadata`, `context_management`)
+- `user-agent` version string
+- `x-stainless-package-version`
+
 ## Credits
 
 Combines approaches from [shahidshabbir-se/opencode-anthropic-oauth](https://github.com/shahidshabbir-se/opencode-anthropic-oauth), [ex-machina-co/opencode-anthropic-auth](https://github.com/ex-machina-co/opencode-anthropic-auth), [vinzabe/PERMANENT-opencode-anthropic-oauth-fix](https://github.com/vinzabe/PERMANENT-opencode-anthropic-oauth-fix), and [lehdqlsl/opencode-claude-auth-sync](https://github.com/lehdqlsl/opencode-claude-auth-sync).
