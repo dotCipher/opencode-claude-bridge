@@ -24,7 +24,54 @@ type AuthType = {
   expires?: number;
 };
 
-type ProviderModel = { cost: unknown };
+type ProviderModel = {
+  cost?: unknown;
+  name?: string;
+  attachment?: boolean;
+  reasoning?: boolean;
+  tool_call?: boolean;
+  temperature?: boolean;
+  limit?: { context: number; output: number };
+  modalities?: { input: string[]; output: string[] };
+};
+
+const ANTHROPIC_MODELS: Record<string, ProviderModel> = {
+  "claude-opus-4-6": {
+    name: "Claude Opus 4.6",
+    attachment: true, reasoning: true, tool_call: true, temperature: false,
+    limit: { context: 200000, output: 32000 },
+    modalities: { input: ["text", "image"], output: ["text"] },
+    cost: { input: 15, output: 75, cache_read: 1.5, cache_write: 18.75 },
+  },
+  "claude-opus-4-5": {
+    name: "Claude Opus 4.5",
+    attachment: true, reasoning: true, tool_call: true, temperature: false,
+    limit: { context: 200000, output: 32000 },
+    modalities: { input: ["text", "image"], output: ["text"] },
+    cost: { input: 15, output: 75, cache_read: 1.5, cache_write: 18.75 },
+  },
+  "claude-sonnet-4-6": {
+    name: "Claude Sonnet 4.6",
+    attachment: true, reasoning: true, tool_call: true, temperature: false,
+    limit: { context: 200000, output: 64000 },
+    modalities: { input: ["text", "image"], output: ["text"] },
+    cost: { input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 },
+  },
+  "claude-sonnet-4-5": {
+    name: "Claude Sonnet 4.5",
+    attachment: true, reasoning: true, tool_call: true, temperature: false,
+    limit: { context: 200000, output: 8192 },
+    modalities: { input: ["text", "image"], output: ["text"] },
+    cost: { input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 },
+  },
+  "claude-haiku-4-5-20251001": {
+    name: "Claude Haiku 4.5",
+    attachment: true, reasoning: false, tool_call: true, temperature: true,
+    limit: { context: 200000, output: 8192 },
+    modalities: { input: ["text", "image"], output: ["text"] },
+    cost: { input: 0.8, output: 4, cache_read: 0.08, cache_write: 1 },
+  },
+};
 
 type PluginClient = {
   auth: {
@@ -132,6 +179,14 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
   // Restored if OAuth isn't active (API key providers still work).
   const savedApiKey = process.env.ANTHROPIC_API_KEY;
 
+  // Bootstrap auth from Claude CLI keychain at plugin init time — before
+  // OpenCode builds its provider state. This ensures the loader runs on
+  // startup so models appear immediately without requiring a restart.
+  try {
+    const tokens = getClaudeTokens();
+    if (tokens) await storeAuth(client, tokens);
+  } catch {}
+
   return {
     "experimental.chat.system.transform": (
       input: { model?: { providerID: string } },
@@ -153,6 +208,14 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
         getAuth: () => Promise<AuthType>,
         provider: { models: Record<string, ProviderModel> },
       ) {
+        // Always inject Claude models — runs before any auth check so models
+        // appear in the selector even on a fresh install with no auth configured
+        if (provider?.models !== undefined) {
+          for (const [id, def] of Object.entries(ANTHROPIC_MODELS)) {
+            if (!provider.models[id]) provider.models[id] = { ...def };
+          }
+        }
+
         let auth = await getAuth();
 
         // Auto-bootstrap from Claude CLI keychain if no OAuth tokens stored
@@ -181,13 +244,6 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
         // OAuth active — set a placeholder so the SDK doesn't error on missing key.
         // Our fetch wrapper sets the real Authorization: Bearer header and removes x-api-key.
         process.env.ANTHROPIC_API_KEY = "oauth-placeholder";
-
-        // Zero out cost for Pro/Max subscription
-        if (provider?.models) {
-          for (const model of Object.values(provider.models)) {
-            model.cost = { input: 0, output: 0, cache: { read: 0, write: 0 } };
-          }
-        }
 
         return {
           ...(auth.access ? { authToken: auth.access } : {}),
@@ -367,7 +423,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             if (tokens) {
               await storeAuth(client, tokens);
               return {
-                instructions: "✓ Connected via Claude CLI — press Esc to close",
+                instructions: "✓ Connected via Claude CLI — press Esc, then restart OpenCode if Anthropic models aren't visible",
                 method: "code" as const,
                 callback: async () => ({ type: "success" as const, ...tokens }),
               };
@@ -444,7 +500,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 body: { type: "apikey", access: envKey, expires: Date.now() + 365 * 24 * 60 * 60 * 1000 },
               });
               return {
-                instructions: "✓ API key found in environment — press Esc to close",
+                instructions: "✓ API key found in environment — press Esc, then restart OpenCode if Anthropic models aren't visible",
                 method: "code" as const,
                 callback: async () => ({ type: "success" as const, access: envKey, refresh: "", expires: Date.now() + 365 * 24 * 60 * 60 * 1000 }),
               };
