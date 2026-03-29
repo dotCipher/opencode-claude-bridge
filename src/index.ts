@@ -188,7 +188,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
   } catch {}
 
   return {
-    "experimental.chat.system.transform": (
+    "experimental.chat.system.transform": async (
       input: { model?: { providerID: string } },
       output: { system: string[] },
     ) => {
@@ -243,10 +243,12 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
 
         // OAuth active — set a placeholder so the SDK doesn't error on missing key.
         // Our fetch wrapper sets the real Authorization: Bearer header and removes x-api-key.
+        // Pass apiKey (not authToken): @ai-sdk/anthropic@3.x throws when both are present,
+        // which happens when ANTHROPIC_API_KEY is set in the desktop env before plugin init.
         process.env.ANTHROPIC_API_KEY = "oauth-placeholder";
 
         return {
-          ...(auth.access ? { authToken: auth.access } : {}),
+          apiKey: "oauth-placeholder",
 
           async fetch(input: string | URL | Request, init?: RequestInit) {
             const auth = await getAuth();
