@@ -8,6 +8,7 @@
 
 import { describe, it, before } from "node:test";
 import assert from "node:assert/strict";
+import { buildTokenCurlArgs } from "./oauth.js";
 
 // ── Helpers (extracted / reimplemented from index.ts for unit testing) ────────
 
@@ -117,5 +118,18 @@ describe("temperature coercion", () => {
       JSON.stringify({ model: "claude-sonnet-4-6", messages: [] }),
     );
     assert.equal(out.temperature, undefined);
+  });
+});
+
+describe("windows compatibility regressions", () => {
+  it("builds curl args without shell escaping requirements", () => {
+    const payload = JSON.stringify({ note: "O'Reilly" });
+    const args = buildTokenCurlArgs(payload);
+
+    assert.equal(args[0], "-s");
+    assert.equal(args[1], "-w");
+    assert.equal(args[2], "\n__HTTP_STATUS__%{http_code}");
+    assert.equal(args[args.length - 2], "-d");
+    assert.equal(args[args.length - 1], payload);
   });
 });

@@ -41,6 +41,23 @@ function sleep(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+export function buildTokenCurlArgs(payload: string): string[] {
+  return [
+    "-s",
+    "-w",
+    "\n__HTTP_STATUS__%{http_code}",
+    "-X",
+    "POST",
+    TOKEN_URL,
+    "-H",
+    "Content-Type: application/json",
+    "-H",
+    `User-Agent: ${USER_AGENT}`,
+    "-d",
+    payload,
+  ];
+}
+
 /**
  * curl-based token exchange to avoid Bun/runtime fetch injecting
  * forbidden headers (Origin, Referer, Sec-Fetch-*) that trigger 429s.
@@ -55,20 +72,7 @@ function curlPost(
     try {
       const result = execFileSync(
         "curl",
-        [
-          "-s",
-          "-w",
-          "\n__HTTP_STATUS__%{http_code}",
-          "-X",
-          "POST",
-          TOKEN_URL,
-          "-H",
-          "Content-Type: application/json",
-          "-H",
-          `User-Agent: ${USER_AGENT}`,
-          "-d",
-          payload,
-        ],
+        buildTokenCurlArgs(payload),
         {
           timeout: 30000,
           encoding: "utf8",
