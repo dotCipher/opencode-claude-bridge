@@ -1,6 +1,6 @@
 import { randomBytes, createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import {
   CLIENT_ID,
   TOKEN_URL,
@@ -38,7 +38,7 @@ function base64url(buf: Buffer): string {
 }
 
 function sleep(ms: number): void {
-  execSync(`sleep ${(ms / 1000).toFixed(3)}`, { timeout: 60000 });
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 /**
@@ -50,17 +50,30 @@ function curlPost(
   retries = 3,
 ): { status: number; body: string } {
   const payload = JSON.stringify(body);
-  const escaped = payload.replace(/'/g, "'\\''");
 
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
-      const result = execSync(
-        `curl -s -w '\\n__HTTP_STATUS__%{http_code}' ` +
-          `-X POST '${TOKEN_URL}' ` +
-          `-H 'Content-Type: application/json' ` +
-          `-H 'User-Agent: ${USER_AGENT}' ` +
-          `-d '${escaped}'`,
-        { timeout: 30000, encoding: "utf8" },
+      const result = execFileSync(
+        "curl",
+        [
+          "-s",
+          "-w",
+          "\n__HTTP_STATUS__%{http_code}",
+          "-X",
+          "POST",
+          TOKEN_URL,
+          "-H",
+          "Content-Type: application/json",
+          "-H",
+          `User-Agent: ${USER_AGENT}`,
+          "-d",
+          payload,
+        ],
+        {
+          timeout: 30000,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        },
       );
 
       const parts = result.split("\n__HTTP_STATUS__");

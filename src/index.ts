@@ -230,7 +230,7 @@ function openBrowser(url: string): void {
         try { attempt(); break; } catch {}
       }
     } else if (process.platform === "win32") {
-      try { execFileSync("cmd", ["/c", "start", url], { timeout: 3000 }); } catch {}
+      try { execFileSync("cmd", ["/c", "start", "", url], { timeout: 3000 }); } catch {}
     } else {
       const attempts: Array<() => void> = [
         () => execFileSync("/usr/bin/xdg-open", [url], { timeout: 3000 }),

@@ -1,4 +1,4 @@
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -6,9 +6,10 @@ import { join } from "node:path";
 function detectClaudeVersion(): string {
   // Try to read version from installed Claude CLI
   try {
-    const version = execSync("claude --version 2>/dev/null", {
+    const version = execFileSync("claude", ["--version"], {
       encoding: "utf8",
       timeout: 3000,
+      stdio: ["ignore", "pipe", "ignore"],
     }).trim();
     const match = version.match(/^(\d+\.\d+\.\d+)/);
     if (match) return match[1];
