@@ -7,6 +7,7 @@ import {
   exchangeCodeForTokens,
   parseAuthCode,
   refreshTokens,
+  startOAuthCallbackServer,
 } from "./oauth.js";
 import { getClaudeTokens, readClaudeCredentials } from "./keychain.js";
 import {
@@ -211,6 +212,35 @@ async function refreshAuth(
     return fresh.access;
   }
   return null;
+}
+
+/** Best-effort browser open — tries multiple methods on each platform. */
+function openBrowser(url: string): void {
+  (async () => {
+    const { execFileSync } = await import("node:child_process");
+
+    if (process.platform === "darwin") {
+      const uid = String(process.getuid?.() ?? "");
+      const attempts: Array<() => void> = [
+        () => execFileSync("/bin/launchctl", ["asuser", uid, "/usr/bin/open", url], { timeout: 5000 }),
+        () => execFileSync("/usr/bin/open", [url], { timeout: 3000 }),
+        () => execFileSync("/usr/bin/osascript", ["-e", `open location "${url}"`], { timeout: 3000 }),
+      ];
+      for (const attempt of attempts) {
+        try { attempt(); break; } catch {}
+      }
+    } else if (process.platform === "win32") {
+      try { execFileSync("cmd", ["/c", "start", url], { timeout: 3000 }); } catch {}
+    } else {
+      const attempts: Array<() => void> = [
+        () => execFileSync("/usr/bin/xdg-open", [url], { timeout: 3000 }),
+        () => execFileSync("/usr/bin/open", [url], { timeout: 3000 }),
+      ];
+      for (const attempt of attempts) {
+        try { attempt(); break; } catch {}
+      }
+    }
+  })().catch(() => {});
 }
 
 /** Merge HeadersInit (Headers | string[][] | Record) onto a Headers object. */
@@ -776,69 +806,104 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
           label: "Claude Pro / Max (OAuth)",
           type: "oauth" as const,
           authorize: async () => {
+            // First try: auto-bootstrap from Claude CLI keychain
             const tokens = getClaudeTokens();
             if (tokens) {
               await storeAuth(client, tokens);
               return {
-                instructions: "✓ Connected via Claude CLI — press Esc, then restart OpenCode if Anthropic models aren't visible",
+                instructions: "Connected via Claude CLI — press Esc, then restart OpenCode if Anthropic models aren't visible",
                 method: "code" as const,
                 callback: async () => ({ type: "success" as const, ...tokens }),
               };
             }
 
+            // Start a local HTTP server to capture the OAuth redirect.
+            // This gives us an ephemeral port so the redirect_uri is
+            // http://localhost:{port}/callback — matching Claude Code's flow.
+            let callbackServer: Awaited<ReturnType<typeof startOAuthCallbackServer>> | null = null;
+            try {
+              callbackServer = await startOAuthCallbackServer();
+            } catch (err) {
+              console.error(`[opencode-oauth] Failed to start callback server: ${err}`);
+            }
+
+            if (callbackServer) {
+              const { url, manualUrl, verifier, port } = callbackServer;
+              const redirectUri = `http://localhost:${port}/callback`;
+
+              // Best-effort browser open
+              openBrowser(url);
+
+              // Race: localhost callback vs manual code paste.
+              // If the browser redirects to localhost, the callback server
+              // captures the code automatically. Otherwise, the user can
+              // paste the code from the manual-flow URL.
+              //
+              // We set up the automatic flow listener in the background.
+              // If the user pastes a code first, that wins.
+              let autoCode: string | null = null;
+              callbackServer.waitForCode().then((code) => {
+                autoCode = code;
+              }).catch(() => {});
+
+              return {
+                url,
+                instructions: `Opening browser for OAuth...\n\nIf the browser redirected back successfully, just press Enter.\nOtherwise, open this URL and paste the code:\n${manualUrl}`,
+                method: "code" as const,
+                callback: async (manualInput: string) => {
+                  try {
+                    // Brief pause to let the auto-flow resolve if it just arrived
+                    if (!autoCode && !manualInput?.trim()) {
+                      await new Promise((r) => setTimeout(r, 500));
+                    }
+
+                    if (autoCode) {
+                      // Auto-flow captured the code via localhost redirect
+                      const tokens = exchangeCodeForTokens(autoCode, verifier, redirectUri);
+                      await storeAuth(client, tokens);
+                      callbackServer?.close();
+                      return { type: "success" as const, ...tokens };
+                    }
+
+                    const code = parseAuthCode(manualInput);
+                    if (!code) {
+                      console.error("[opencode-oauth] No authorization code received");
+                      callbackServer?.close();
+                      return { type: "failed" as const };
+                    }
+
+                    // Manual flow — redirect_uri defaults to MANUAL_REDIRECT_URL
+                    const tokens = exchangeCodeForTokens(code, verifier);
+                    await storeAuth(client, tokens);
+                    callbackServer?.close();
+                    return { type: "success" as const, ...tokens };
+                  } catch (err) {
+                    console.error(`[opencode-oauth] Token exchange failed: ${err}`);
+                    callbackServer?.close();
+                    return { type: "failed" as const };
+                  }
+                },
+              };
+            }
+
+            // Fallback: no callback server — use manual redirect URL flow only.
+            // This is the path for environments where we can't bind localhost.
             const { url, verifier } = createAuthorizationRequest();
 
-            // Best-effort browser open — try launchctl asuser (escapes sidecar sandbox),
-            // plain open, and osascript in order. Also write a .command file to Desktop.
-            (async () => {
-              const { execFileSync } = await import("node:child_process");
-              const { writeFileSync, chmodSync } = await import("node:fs");
-              const { homedir } = await import("node:os");
-              const { join } = await import("node:path");
-
-              if (process.platform === "darwin") {
-                // Write .command file to Desktop as a guaranteed fallback
-                try {
-                  const safe = url.replace(/'/g, "'\\''");
-                  const script = `#!/bin/bash\n/usr/bin/open '${safe}'\nrm -f "$0"\n`;
-                  const scriptPath = join(homedir(), "Desktop", "opencode-oauth.command");
-                  writeFileSync(scriptPath, script);
-                  chmodSync(scriptPath, 0o755);
-                } catch {}
-
-                // Try to open browser directly
-                const uid = String(process.getuid?.() ?? "");
-                const attempts: Array<() => void> = [
-                  () => execFileSync("/bin/launchctl", ["asuser", uid, "/usr/bin/open", url], { timeout: 5000 }),
-                  () => execFileSync("/usr/bin/open", [url], { timeout: 3000 }),
-                  () => execFileSync("/usr/bin/osascript", ["-e", `open location "${url}"`], { timeout: 3000 }),
-                ];
-                for (const attempt of attempts) {
-                  try { attempt(); break; } catch {}
-                }
-              } else if (process.platform === "win32") {
-                try { execFileSync("cmd", ["/c", "start", url], { timeout: 3000 }); } catch {}
-              } else {
-                const attempts: Array<() => void> = [
-                  () => execFileSync("/usr/bin/xdg-open", [url], { timeout: 3000 }),
-                  () => execFileSync("/usr/bin/open", [url], { timeout: 3000 }),
-                ];
-                for (const attempt of attempts) {
-                  try { attempt(); break; } catch {}
-                }
-              }
-            })().catch(() => {});
+            openBrowser(url);
 
             return {
               url,
-              instructions: `Opening browser… If nothing opens, double-click 'opencode-oauth.command' on your Desktop, then paste the authorization code below:\n\n${url}`,
+              instructions: `Opening browser for OAuth...\n\nAfter authorizing, you'll see a code — paste it below:\n${url}`,
               method: "code" as const,
               callback: async (code: string) => {
                 try {
+                  // redirect_uri defaults to MANUAL_REDIRECT_URL in exchangeCodeForTokens
                   const tokens = exchangeCodeForTokens(parseAuthCode(code), verifier);
                   await storeAuth(client, tokens);
                   return { type: "success" as const, ...tokens };
-                } catch {
+                } catch (err) {
+                  console.error(`[opencode-oauth] Token exchange failed: ${err}`);
                   return { type: "failed" as const };
                 }
               },

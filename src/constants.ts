@@ -40,31 +40,18 @@ export const AUTHORIZE_URL =
   process.env.ANTHROPIC_AUTHORIZE_URL ||
   "https://claude.ai/oauth/authorize";
 
-// Claude Code uses a local redirect — a local HTTP server catches the callback.
-// The redirect_uri includes the dynamic port: http://localhost:{port}/callback
-// This constant is only used as a fallback; the real redirect_uri is built at
-// runtime with the actual port from startOAuthCallbackServer().
-export const REDIRECT_URI =
-  process.env.ANTHROPIC_REDIRECT_URI ||
-  "http://localhost/callback";
-
-// Manual redirect URL — used when local server can't receive the callback
+// Manual redirect URL — used when the local server can't receive the callback
 // (e.g., user copies the code from the browser). This matches Claude CLI's
 // MANUAL_REDIRECT_URL from the production OAuth config.
 export const MANUAL_REDIRECT_URL =
   process.env.ANTHROPIC_MANUAL_REDIRECT_URL ||
   "https://platform.claude.com/oauth/code/callback";
 
-// Default port for the local OAuth callback server (0 = auto-assign)
-export const OAUTH_CALLBACK_PORT = parseInt(
-  process.env.ANTHROPIC_OAUTH_CALLBACK_PORT || "0",
-  10,
-);
-
-// Exact scopes from Claude Code 2.1.98 binary
+// All OAuth scopes — union of Console + Claude.ai scopes, matching Claude CLI's
+// ALL_OAUTH_SCOPES. Includes org:create_api_key for Console -> Claude.ai redirect.
 export const SCOPES =
   process.env.ANTHROPIC_SCOPES ||
-  "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+  "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 
 export const CLI_VERSION =
   process.env.ANTHROPIC_CLI_VERSION || detectClaudeVersion();
