@@ -154,6 +154,9 @@ export function startOAuthCallbackServer(): Promise<OAuthCallbackServer> {
       codeReject = rej;
     });
 
+    const escapeHtml = (s: string) =>
+      s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
     const server = createServer((req: IncomingMessage, res: ServerResponse) => {
       const url = new URL(req.url || "/", `http://localhost`);
 
@@ -164,7 +167,7 @@ export function startOAuthCallbackServer(): Promise<OAuthCallbackServer> {
         if (error) {
           const desc = url.searchParams.get("error_description") || error;
           res.writeHead(200, { "Content-Type": "text/html" });
-          res.end(`<html><body><h2>Authorization failed</h2><p>${desc}</p><p>You can close this window.</p></body></html>`);
+          res.end(`<html><body><h2>Authorization failed</h2><p>${escapeHtml(desc)}</p><p>You can close this window.</p></body></html>`);
           codeReject?.(new Error(`OAuth error: ${desc}`));
           return;
         }
