@@ -104,13 +104,20 @@ Claude Code and OpenCode use different parameter naming conventions. The bridge 
 | `include` (in Grep) | `glob` |
 | `priority` (in TodoWrite) | `activeForm` |
 
+Additional shared-tool bridging handled by the bridge:
+
+- `Agent` / `task` — defaults missing `subagent_type` to `general`, strips unsupported Claude-only fields inbound, and strips OpenCode-only history fields outbound
+- `AskUserQuestion` / `question` — maps `multiSelect` <-> `multiple`
+- `Skill` — maps `skill` <-> `name`
+- `WebFetch` — best-effort bridge between Claude's `prompt` and OpenCode's `format` by using `markdown` inbound and synthesizing a Claude prompt outbound
+
 ### Agent type translation
 
 Claude Code uses different agent/subagent types than OpenCode:
 
 | Claude Code | OpenCode |
 |---|---|
-| `general-purpose` | `build` |
+| `general-purpose` | `general` |
 | `Explore` | `explore` |
 | `Plan` | `plan` |
 | `statusline-setup` | `build` |
