@@ -89,6 +89,8 @@ const OUTBOUND_TOOL_NAME_MAP: Record<string, string> = {
   mcp_webfetch: "WebFetch",
   mcp_todowrite: "TodoWrite",
   mcp_skill: "Skill",
+  question: "AskUserQuestion",
+  mcp_question: "AskUserQuestion",
 };
 
 const INBOUND_TOOL_NAME_MAP: Record<string, string> = {
@@ -102,6 +104,7 @@ const INBOUND_TOOL_NAME_MAP: Record<string, string> = {
   WebFetch: "webfetch",
   TodoWrite: "todowrite",
   Skill: "skill",
+  AskUserQuestion: "question",
 };
 
 const ANTHROPIC_MODELS: Record<string, ProviderModel> = {
@@ -279,6 +282,27 @@ function deduplicatePrefix(text: string): string {
 function mapOutboundToolName(name: string | undefined): string | undefined {
   if (!name) return name;
   return OUTBOUND_TOOL_NAME_MAP[name] || name;
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function stripScalarJsonField(text: string, field: string): string {
+  const escapedField = escapeRegExp(field);
+  const valuePattern = String.raw`(?:"(?:[^"\\]|\\.)*"|true|false|null|-?\d+(?:\.\d+)?)`;
+  return text
+    .replace(new RegExp(`"${escapedField}"\\s*:\\s*${valuePattern}\\s*,`, "g"), "")
+    .replace(new RegExp(`,\\s*"${escapedField}"\\s*:\\s*${valuePattern}`, "g"), "");
+}
+
+function ensureInputStringField(text: string, field: string, value: string): string {
+  if (text.includes(`"${field}"`)) return text;
+  const exactEmpty = /"input"\s*:\s*\{\s*\}/;
+  if (exactEmpty.test(text)) {
+    return text.replace(exactEmpty, `"input":{"${field}":"${value}"}`);
+  }
+  return text.replace(/"input"\s*:\s*\{/, `"input":{"${field}":"${value}",`);
 }
 
 function maybeUnquoteText(text: string): string {
@@ -618,16 +642,53 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                             block.input as Record<string, unknown>,
                           );
                           // Agent: translate OpenCode subagent_type values → Claude values
-                          if (block.name === "Agent" && typeof (block.input as Record<string, unknown>).subagent_type === "string") {
-                            const agentMap: Record<string, string> = {
-                              build: "general-purpose",
-                              explore: "Explore",
-                              plan: "Plan",
-                            };
-                            const cur = (block.input as Record<string, unknown>).subagent_type as string;
-                            if (agentMap[cur]) {
-                              (block.input as Record<string, unknown>).subagent_type = agentMap[cur];
+                          if (block.name === "Agent") {
+                            if (typeof (block.input as Record<string, unknown>).subagent_type === "string") {
+                              const agentMap: Record<string, string> = {
+                                build: "general-purpose",
+                                general: "general-purpose",
+                                explore: "Explore",
+                                plan: "Plan",
+                              };
+                              const cur = (block.input as Record<string, unknown>).subagent_type as string;
+                              if (agentMap[cur]) {
+                                (block.input as Record<string, unknown>).subagent_type = agentMap[cur];
+                              }
                             }
+                            delete (block.input as Record<string, unknown>).task_id;
+                            delete (block.input as Record<string, unknown>).command;
+                          }
+                          // AskUserQuestion: OpenCode uses `multiple`, Claude uses `multiSelect`.
+                          if (block.name === "AskUserQuestion" && Array.isArray((block.input as Record<string, unknown>).questions)) {
+                            for (const item of (block.input as Record<string, unknown>).questions as Array<Record<string, unknown>>) {
+                              if (typeof item.multiple === "boolean" && item.multiSelect === undefined) {
+                                item.multiSelect = item.multiple;
+                                delete item.multiple;
+                              }
+                            }
+                          }
+                          // Skill: OpenCode uses `name`, Claude uses `skill`.
+                          if (block.name === "Skill") {
+                            const input = block.input as Record<string, unknown>;
+                            if (typeof input.name === "string" && input.skill === undefined) {
+                              input.skill = input.name;
+                              delete input.name;
+                            }
+                          }
+                          // WebFetch: OpenCode uses `format`, Claude uses a freeform `prompt`.
+                          // Best-effort bridge: synthesize a prompt from the requested format.
+                          if (block.name === "WebFetch") {
+                            const input = block.input as Record<string, unknown>;
+                            if (typeof input.format === "string" && input.prompt === undefined) {
+                              const format = input.format;
+                              input.prompt = format === "text"
+                                ? "Fetch this URL and return the content as plain text."
+                                : format === "html"
+                                ? "Fetch this URL and return the raw HTML."
+                                : "Fetch this URL and return the content as markdown.";
+                              delete input.format;
+                            }
+                            delete input.timeout;
                           }
                           // TodoWrite: translate OpenCode fields → Claude fields
                           // OpenCode: { content, status, priority } with status ∈ {pending, in_progress, completed, cancelled}
@@ -736,6 +797,16 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                       : `"name": "${name}"`;
                   });
 
+                  // OpenCode requires a task subagent_type; Claude may omit it for
+                  // the default general-purpose agent. Seed the default at
+                  // content_block_start so later deltas can override it.
+                  if (currentToolName === "Agent" && text.includes('"content_block_start"')) {
+                    text = ensureInputStringField(text, "subagent_type", "general");
+                  }
+                  if (currentToolName === "WebFetch" && text.includes('"content_block_start"')) {
+                    text = ensureInputStringField(text, "format", "markdown");
+                  }
+
                   // Translate snake_case argument keys to camelCase in
                   // streamed tool input JSON. The model streams tool arguments
                   // as partial JSON in input_json_delta events. We translate
@@ -766,9 +837,13 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                     if (currentToolName === "TodoWrite") {
                       text = text.replace(/"activeForm"\s*:/g, '"priority":');
                     }
+                    // AskUserQuestion: multiSelect → multiple
+                    if (currentToolName === "AskUserQuestion") {
+                      text = text.replace(/"multiSelect"\s*:/g, '"multiple":');
+                    }
                     // Agent: translate Claude's subagent_type values to OpenCode's.
                     // Claude uses "general-purpose", "Explore", "Plan", "statusline-setup".
-                    // OpenCode has "build" (default) and "plan" as built-in agents.
+                    // OpenCode has "build", "general", "explore", and "plan" agents.
                     // We match the full key:value pair to avoid replacing these
                     // strings inside prompt/description text.
                     if (currentToolName === "Agent") {
@@ -776,7 +851,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                         /"subagent_type"\s*:\s*"(general-purpose|statusline-setup|Explore|Plan)"/g,
                         (_m, val: string) => {
                           const map: Record<string, string> = {
-                            "general-purpose": "build",
+                            "general-purpose": "general",
                             "statusline-setup": "build",
                             "Explore": "explore",
                             "Plan": "plan",
@@ -784,6 +859,28 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                           return `"subagent_type": "${map[val] || val}"`;
                         },
                       );
+                      text = stripScalarJsonField(text, "model");
+                      text = stripScalarJsonField(text, "run_in_background");
+                      text = stripScalarJsonField(text, "isolation");
+                    }
+                    if (currentToolName === "Bash") {
+                      text = stripScalarJsonField(text, "run_in_background");
+                      text = stripScalarJsonField(text, "dangerouslyDisableSandbox");
+                    }
+                    if (currentToolName === "Read") {
+                      text = stripScalarJsonField(text, "pages");
+                    }
+                    if (currentToolName === "Grep") {
+                      for (const field of ["output_mode", "-B", "-A", "-C", "context", "-n", "-i", "type", "head_limit", "offset", "multiline"]) {
+                        text = stripScalarJsonField(text, field);
+                      }
+                    }
+                    if (currentToolName === "Skill") {
+                      text = text.replace(/"skill"\s*:/g, '"name":');
+                      text = stripScalarJsonField(text, "args");
+                    }
+                    if (currentToolName === "WebFetch") {
+                      text = stripScalarJsonField(text, "prompt");
                     }
                   }
 

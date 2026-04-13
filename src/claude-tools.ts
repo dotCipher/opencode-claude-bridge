@@ -214,7 +214,7 @@ const SHARED_TOOLS: ToolDefinition[] = [
           enum: ["worktree"],
         },
       },
-      required: ["description", "prompt"],
+      required: ["description", "prompt", "subagent_type"],
       additionalProperties: false,
     },
   },
