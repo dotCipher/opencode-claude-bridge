@@ -98,22 +98,21 @@ export const PARAM_SNAKE_TO_CAMEL: Record<string, Record<string, string>> = {
   },
   // Agent: Claude has model/run_in_background/isolation that OpenCode doesn't have.
   // OpenCode has task_id/command that Claude doesn't have.
-  // The shared params (description, prompt, subagent_type) are the same name.
   Agent: {
-    // All shared params have same names, no translation needed
+    // All shared params have same names, no renaming needed
   },
   // WebFetch: Claude uses "prompt", OpenCode uses "format".
-  // These are fundamentally different params — special handling needed.
+  // We strip "prompt" inbound and inject a default "format" so OpenCode's
+  // webfetch tool receives a valid payload. Outbound does the reverse:
+  // synthesizes a "prompt" from "format" so Claude's schema is satisfied.
   WebFetch: {
-    // prompt has no equivalent in OpenCode; format has no equivalent in Claude
-    // Handled via special logic in the bridge
+    // Handled specially in translateToolArgsJsonString / translateArgsOpencodeToClaude
   },
   TodoWrite: {
-    // Both use "todos" array but the item shape differs:
-    // Claude: { content, status, activeForm } with status enum [pending, in_progress, completed]
-    // OpenCode: { content, status, priority } with status enum [pending, in_progress, completed, cancelled]
-    // The activeForm field is Claude-only; priority is OpenCode-only.
-    // We strip activeForm inbound since OpenCode doesn't use it.
+    // Item shape differs — handled specially (activeForm → priority per item)
+  },
+  Skill: {
+    skill: "name", // Claude sends "skill" (the name), OpenCode expects "name"
   },
 };
 
@@ -133,44 +132,202 @@ export const PARAM_CAMEL_TO_SNAKE: Record<string, Record<string, string>> = {
   Grep: {
     include: "glob",
   },
+  Skill: {
+    name: "skill",
+  },
 };
 
 /**
- * Translate tool_use arguments from Claude's snake_case to OpenCode's camelCase.
- * Returns a new object with translated keys.
+ * Single source of truth for Claude ↔ OpenCode subagent_type mappings.
+ *
+ * Inbound (Claude → OpenCode) and outbound (OpenCode → Claude) are kept
+ * explicit rather than derived because they're not perfect inverses:
+ * both OpenCode "build" and "general" map to Claude "general-purpose".
  */
-export function translateArgsSnakeToCamel(
-  toolName: string,
-  args: Record<string, unknown>,
-): Record<string, unknown> {
-  const map = PARAM_SNAKE_TO_CAMEL[toolName];
-  if (!map || Object.keys(map).length === 0) return args;
+export const AGENT_TYPE_CLAUDE_TO_OPENCODE: Record<string, string> = {
+  "general-purpose": "general",
+  "statusline-setup": "build",
+  "Explore": "explore",
+  "Plan": "plan",
+};
 
-  const result: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(args)) {
-    const newKey = map[key] || key;
-    result[newKey] = value;
+export const AGENT_TYPE_OPENCODE_TO_CLAUDE: Record<string, string> = {
+  build: "general-purpose",
+  general: "general-purpose",
+  explore: "Explore",
+  plan: "Plan",
+};
+
+/**
+ * Fields to strip from Claude's schema that OpenCode's tool doesn't accept.
+ * Keyed by Claude tool name. These are fields present in Claude's wire
+ * schema but not in OpenCode's Zod schema — Zod in non-strict mode would
+ * silently drop them, but we drop them explicitly so behavior is
+ * independent of OpenCode's validation mode.
+ */
+const INBOUND_FIELDS_TO_STRIP: Record<string, string[]> = {
+  Agent: ["model", "run_in_background", "isolation"],
+  Bash: ["run_in_background", "dangerouslyDisableSandbox"],
+  Read: ["pages"],
+  Grep: ["output_mode", "-B", "-A", "-C", "context", "-n", "-i", "type", "head_limit", "offset", "multiline"],
+  Skill: ["args"],
+  WebFetch: ["prompt"], // stripped because we inject "format" instead
+};
+
+/**
+ * Translate tool argument JSON from Claude's schema to OpenCode's schema.
+ * Used by the SSE stream processor after all partial_json fragments for a
+ * tool_use block have been buffered.
+ *
+ * Parses the JSON and walks the object — do NOT regex-substitute on the
+ * raw string, because a key name can legitimately appear inside a value
+ * (e.g. a TodoWrite item whose content literally says 'activeForm',
+ * or a Bash command with "file_path=..." inside a heredoc).
+ */
+export function translateToolArgsJsonString(json: string, toolName: string): string {
+  let obj: unknown;
+  try {
+    obj = JSON.parse(json);
+  } catch {
+    // Malformed — pass through rather than corrupt. The downstream
+    // consumer will surface the parse error with a clearer message.
+    return json;
   }
-  return result;
+  if (obj === null || typeof obj !== "object" || Array.isArray(obj)) {
+    return json;
+  }
+  const record = obj as Record<string, unknown>;
+
+  // 1. Top-level key renames from PARAM_SNAKE_TO_CAMEL (Read, Write, Edit,
+  //    Grep, Skill).
+  const keyMap = PARAM_SNAKE_TO_CAMEL[toolName];
+  let out: Record<string, unknown> = record;
+  if (keyMap && Object.keys(keyMap).length > 0) {
+    out = {};
+    for (const [k, v] of Object.entries(record)) {
+      out[keyMap[k] || k] = v;
+    }
+  }
+
+  // 2. Strip Claude-only fields OpenCode doesn't accept.
+  const stripFields = INBOUND_FIELDS_TO_STRIP[toolName];
+  if (stripFields) {
+    for (const field of stripFields) delete out[field];
+  }
+
+  // 3. Tool-specific deeper translations.
+  if (toolName === "TodoWrite" && Array.isArray(out.todos)) {
+    // Claude: { content, status, activeForm }. OpenCode: { content, status, priority }.
+    // OpenCode's priority is typed as z.string() so the activeForm text works fine.
+    for (const item of out.todos as Array<Record<string, unknown>>) {
+      if (item && typeof item === "object" && "activeForm" in item) {
+        item.priority = item.activeForm;
+        delete item.activeForm;
+      }
+    }
+  }
+  if (toolName === "Agent" && typeof out.subagent_type === "string") {
+    const mapped = AGENT_TYPE_CLAUDE_TO_OPENCODE[out.subagent_type];
+    if (mapped) out.subagent_type = mapped;
+  }
+  if (toolName === "AskUserQuestion" && Array.isArray(out.questions)) {
+    // Claude uses "multiSelect", OpenCode's question tool uses "multiple".
+    for (const item of out.questions as Array<Record<string, unknown>>) {
+      if (item && typeof item === "object" && "multiSelect" in item) {
+        item.multiple = item.multiSelect;
+        delete item.multiSelect;
+      }
+    }
+  }
+  if (toolName === "WebFetch") {
+    // OpenCode's webfetch takes a `format` field (markdown/text/html).
+    // Default it to markdown if Claude didn't send one (it never does,
+    // since Claude's WebFetch has no equivalent field).
+    if (typeof out.format !== "string") {
+      out.format = "markdown";
+    }
+  }
+  if (toolName === "Agent" && typeof out.subagent_type !== "string") {
+    // OpenCode's task tool requires subagent_type. Default to "general"
+    // (the closest equivalent to Claude's default "general-purpose").
+    out.subagent_type = "general";
+  }
+
+  return JSON.stringify(out);
 }
 
 /**
- * Translate tool_use arguments from OpenCode's camelCase to Claude's snake_case.
- * Returns a new object with translated keys.
+ * Translate tool_use arguments from OpenCode's schema to Claude's schema.
+ * Used on the outbound path (message history being sent back to the API).
+ *
+ * This is the counterpart to translateToolArgsJsonString — they must stay
+ * in lockstep so round-trips preserve meaning.
  */
-export function translateArgsCamelToSnake(
+export function translateArgsOpencodeToClaude(
   toolName: string,
   args: Record<string, unknown>,
 ): Record<string, unknown> {
+  // 1. Top-level key renames (camelCase → snake_case)
   const map = PARAM_CAMEL_TO_SNAKE[toolName];
-  if (!map || Object.keys(map).length === 0) return args;
-
-  const result: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(args)) {
-    const newKey = map[key] || key;
-    result[newKey] = value;
+  let out: Record<string, unknown> = args;
+  if (map && Object.keys(map).length > 0) {
+    out = {};
+    for (const [k, v] of Object.entries(args)) {
+      out[map[k] || k] = v;
+    }
   }
-  return result;
+
+  // 2. Agent: translate OpenCode subagent_type values → Claude values;
+  //    strip OpenCode-only fields that aren't in Claude's schema.
+  if (toolName === "Agent") {
+    if (typeof out.subagent_type === "string") {
+      const mapped = AGENT_TYPE_OPENCODE_TO_CLAUDE[out.subagent_type];
+      if (mapped) out.subagent_type = mapped;
+    }
+    delete out.task_id;
+    delete out.command;
+  }
+
+  // 3. TodoWrite: OpenCode { priority, status∈{…,cancelled} } → Claude
+  //    { activeForm, status∈{pending,in_progress,completed} }.
+  if (toolName === "TodoWrite" && Array.isArray(out.todos)) {
+    for (const item of out.todos as Array<Record<string, unknown>>) {
+      if (item.priority && !item.activeForm) {
+        item.activeForm = item.priority;
+        delete item.priority;
+      }
+      if (item.status === "cancelled") {
+        item.status = "completed";
+      }
+    }
+  }
+
+  // 4. AskUserQuestion: OpenCode uses "multiple", Claude uses "multiSelect".
+  if (toolName === "AskUserQuestion" && Array.isArray(out.questions)) {
+    for (const item of out.questions as Array<Record<string, unknown>>) {
+      if (typeof item.multiple === "boolean" && item.multiSelect === undefined) {
+        item.multiSelect = item.multiple;
+        delete item.multiple;
+      }
+    }
+  }
+
+  // 5. WebFetch: OpenCode uses "format", Claude uses a freeform "prompt".
+  //    Best-effort bridge: synthesize a prompt from the requested format.
+  if (toolName === "WebFetch") {
+    if (typeof out.format === "string" && out.prompt === undefined) {
+      const format = out.format;
+      out.prompt = format === "text"
+        ? "Fetch this URL and return the content as plain text."
+        : format === "html"
+        ? "Fetch this URL and return the raw HTML."
+        : "Fetch this URL and return the content as markdown.";
+      delete out.format;
+    }
+    delete out.timeout; // OpenCode-only
+  }
+
+  return out;
 }
 
 // ── Claude Code Tool Definitions (wire-captured) ───────────────────

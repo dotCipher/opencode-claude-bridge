@@ -27,13 +27,12 @@ import {
 } from "./constants.js";
 import {
   getClaudeTools,
-  STUB_TOOL_NAMES,
-  SHARED_TOOL_NAMES,
-  translateArgsSnakeToCamel,
-  translateArgsCamelToSnake,
+  translateArgsOpencodeToClaude,
+  translateToolArgsJsonString,
   computeFingerprint,
   extractFirstUserMessageText,
 } from "./claude-tools.js";
+import { createSseProcessor } from "./stream.js";
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -159,6 +158,23 @@ type PluginClient = {
 const CLAUDE_PREFIX =
   "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 
+/**
+ * Diagnostic logger gated by OPENCODE_CLAUDE_BRIDGE_DEBUG=1.
+ *
+ * The bridge defensively swallows errors in optional-feature paths
+ * (fingerprint, profile fetch, keychain bootstrap, OAuth browser open,
+ * body transform) so that a transient failure never breaks the actual
+ * request. Silence is fine for the happy path but kills diagnosability
+ * when a user reports "tools don't work" — set the env var to route
+ * those errors to stderr.
+ */
+const DEBUG = process.env.OPENCODE_CLAUDE_BRIDGE_DEBUG === "1";
+function debugLog(msg: string, err?: unknown): void {
+  if (!DEBUG) return;
+  const suffix = err instanceof Error ? `: ${err.message}` : err !== undefined ? `: ${String(err)}` : "";
+  console.error(`[opencode-claude-bridge] ${msg}${suffix}`);
+}
+
 const oauthProfileCache = new Map<string, Promise<OAuthProfile | null>>();
 const SYSTEM_PROMPT_CACHE_PATH = process.env.ANTHROPIC_SYSTEM_PROMPT_PATH
   || join(process.env.HOME || "", ".cache", "opencode-claude-bridge", "claude-system-prompt.json");
@@ -191,11 +207,12 @@ async function refreshAuth(
   try {
     const kt = getClaudeTokens();
     if (kt && kt.expires > Date.now() + 60_000) fresh = kt;
-  } catch {}
+  } catch (e) { debugLog("refreshAuth: keychain read failed", e); }
 
   // Layer 2: Stored refresh token
   if (!fresh && auth.refresh) {
-    try { fresh = refreshTokens(auth.refresh); } catch {}
+    try { fresh = refreshTokens(auth.refresh); }
+    catch (e) { debugLog("refreshAuth: stored refresh token failed", e); }
   }
 
   // Layer 3: CLI refresh token
@@ -204,7 +221,7 @@ async function refreshAuth(
       const creds = readClaudeCredentials();
       if (creds?.claudeAiOauth?.refreshToken)
         fresh = refreshTokens(creds.claudeAiOauth.refreshToken);
-    } catch {}
+    } catch (e) { debugLog("refreshAuth: CLI refresh token failed", e); }
   }
 
   if (fresh) {
@@ -224,26 +241,29 @@ function openBrowser(url: string): void {
 
     if (process.platform === "darwin") {
       const uid = String(process.getuid?.() ?? "");
-      const attempts: Array<() => void> = [
-        () => execFileSync("/bin/launchctl", ["asuser", uid, "/usr/bin/open", url], { timeout: 5000 }),
-        () => execFileSync("/usr/bin/open", [url], { timeout: 3000 }),
-        () => execFileSync("/usr/bin/osascript", ["-e", `open location "${url}"`], { timeout: 3000 }),
+      const attempts: Array<[string, () => void]> = [
+        ["launchctl asuser", () => execFileSync("/bin/launchctl", ["asuser", uid, "/usr/bin/open", url], { timeout: 5000 })],
+        ["open", () => execFileSync("/usr/bin/open", [url], { timeout: 3000 })],
+        ["osascript", () => execFileSync("/usr/bin/osascript", ["-e", `open location "${url}"`], { timeout: 3000 })],
       ];
-      for (const attempt of attempts) {
-        try { attempt(); break; } catch {}
+      for (const [name, attempt] of attempts) {
+        try { attempt(); break; }
+        catch (e) { debugLog(`openBrowser: ${name} failed`, e); }
       }
     } else if (process.platform === "win32") {
-      try { execFileSync("cmd", ["/c", "start", "", url], { timeout: 3000 }); } catch {}
+      try { execFileSync("cmd", ["/c", "start", "", url], { timeout: 3000 }); }
+      catch (e) { debugLog("openBrowser: cmd start failed", e); }
     } else {
-      const attempts: Array<() => void> = [
-        () => execFileSync("/usr/bin/xdg-open", [url], { timeout: 3000 }),
-        () => execFileSync("/usr/bin/open", [url], { timeout: 3000 }),
+      const attempts: Array<[string, () => void]> = [
+        ["xdg-open", () => execFileSync("/usr/bin/xdg-open", [url], { timeout: 3000 })],
+        ["open", () => execFileSync("/usr/bin/open", [url], { timeout: 3000 })],
       ];
-      for (const attempt of attempts) {
-        try { attempt(); break; } catch {}
+      for (const [name, attempt] of attempts) {
+        try { attempt(); break; }
+        catch (e) { debugLog(`openBrowser: ${name} failed`, e); }
       }
     }
-  })().catch(() => {});
+  })().catch((e) => debugLog("openBrowser: IIFE rejected", e));
 }
 
 /** Merge HeadersInit (Headers | string[][] | Record) onto a Headers object. */
@@ -284,34 +304,15 @@ function mapOutboundToolName(name: string | undefined): string | undefined {
   return OUTBOUND_TOOL_NAME_MAP[name] || name;
 }
 
-function escapeRegExp(text: string): string {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function stripScalarJsonField(text: string, field: string): string {
-  const escapedField = escapeRegExp(field);
-  const valuePattern = String.raw`(?:"(?:[^"\\]|\\.)*"|true|false|null|-?\d+(?:\.\d+)?)`;
-  return text
-    .replace(new RegExp(`"${escapedField}"\\s*:\\s*${valuePattern}\\s*,`, "g"), "")
-    .replace(new RegExp(`,\\s*"${escapedField}"\\s*:\\s*${valuePattern}`, "g"), "");
-}
-
-function ensureInputStringField(text: string, field: string, value: string): string {
-  if (text.includes(`"${field}"`)) return text;
-  const exactEmpty = /"input"\s*:\s*\{\s*\}/;
-  if (exactEmpty.test(text)) {
-    return text.replace(exactEmpty, `"input":{"${field}":"${value}"}`);
-  }
-  return text.replace(/"input"\s*:\s*\{/, `"input":{"${field}":"${value}",`);
-}
-
 function maybeUnquoteText(text: string): string {
   const trimmed = text.trim();
   if (!trimmed.startsWith("\"")) return text;
   try {
     const parsed = JSON.parse(trimmed);
     if (typeof parsed === "string") return parsed;
-  } catch {}
+  } catch {
+    // Expected for non-JSON text — don't log.
+  }
   return text;
 }
 
@@ -358,7 +359,12 @@ function readCachedClaudePromptCache(): ClaudeSystemPromptCache | null {
     const parsed = JSON.parse(raw) as ClaudeSystemPromptCache;
     if (!Array.isArray(parsed.system) || parsed.system.length === 0) return null;
     return parsed;
-  } catch {
+  } catch (e) {
+    // File-not-found is the expected case on a fresh install — only log
+    // other errors (permissions, malformed JSON).
+    if (e instanceof Error && !e.message.includes("ENOENT")) {
+      debugLog("readCachedClaudePromptCache failed", e);
+    }
     return null;
   }
 }
@@ -367,10 +373,13 @@ function getStableDeviceId(): string {
   let who = "unknown";
   try {
     who = `${userInfo().username}@${hostname()}`;
-  } catch {
+  } catch (e) {
+    debugLog("getStableDeviceId: userInfo/hostname failed, falling back to env", e);
     try {
       who = `${process.env.USER || process.env.USERNAME || "unknown"}@${hostname()}`;
-    } catch {}
+    } catch (e2) {
+      debugLog("getStableDeviceId: env fallback failed, using 'unknown'", e2);
+    }
   }
   return createHash("sha256").update(who).digest("hex");
 }
@@ -409,7 +418,8 @@ async function fetchOAuthProfile(accessToken: string): Promise<OAuthProfile | nu
       });
       if (!response.ok) return null;
       return await response.json() as OAuthProfile;
-    } catch {
+    } catch (e) {
+      debugLog("fetchOAuthProfile failed", e);
       return null;
     }
   })();
@@ -435,7 +445,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
   try {
     const tokens = getClaudeTokens();
     if (tokens) await storeAuth(client, tokens);
-  } catch {}
+  } catch (e) { debugLog("init: keychain bootstrap failed", e); }
 
   return {
     "experimental.chat.system.transform": (
@@ -476,7 +486,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
               await storeAuth(client, tokens);
               auth = { type: "oauth", ...tokens };
             }
-          } catch {}
+          } catch (e) { debugLog("loader: keychain auto-bootstrap failed", e); }
         }
 
         // API key mode — set the key in env and let the SDK handle everything
@@ -558,13 +568,18 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 }
 
                 if (!parsed.system) parsed.system = [];
-                if (!parsed.context_management) {
-                  parsed.context_management = {
-                    edits: [{ type: CLEAR_THINKING_TYPE, keep: "all" }],
-                  };
-                }
-                if (!parsed.output_config) {
-                  parsed.output_config = { effort: DEFAULT_EFFORT };
+                // context_management and output_config.effort are only
+                // supported by thinking-capable models. Sending them to
+                // haiku (used for title generation) produces a 400.
+                if (supportsThinking) {
+                  if (!parsed.context_management) {
+                    parsed.context_management = {
+                      edits: [{ type: CLEAR_THINKING_TYPE, keep: "all" }],
+                    };
+                  }
+                  if (!parsed.output_config) {
+                    parsed.output_config = { effort: DEFAULT_EFFORT };
+                  }
                 }
 
                 const profile = auth.access
@@ -635,76 +650,16 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                       }
                       if (block.type === "tool_use" && block.name) {
                         block.name = mapOutboundToolName(block.name);
-                        // Translate arguments from OpenCode's camelCase to Claude's snake_case
+                        // Consolidated OpenCode → Claude argument translation:
+                        // key renames, Agent/AskUserQuestion/Skill/WebFetch/TodoWrite
+                        // field bridging. Mirrors translateToolArgsJsonString
+                        // (inbound) so round-trips preserve meaning. See
+                        // translateArgsOpencodeToClaude in claude-tools.ts.
                         if (block.input && typeof block.input === "object") {
-                          block.input = translateArgsCamelToSnake(
+                          block.input = translateArgsOpencodeToClaude(
                             block.name,
                             block.input as Record<string, unknown>,
                           );
-                          // Agent: translate OpenCode subagent_type values → Claude values
-                          if (block.name === "Agent") {
-                            if (typeof (block.input as Record<string, unknown>).subagent_type === "string") {
-                              const agentMap: Record<string, string> = {
-                                build: "general-purpose",
-                                general: "general-purpose",
-                                explore: "Explore",
-                                plan: "Plan",
-                              };
-                              const cur = (block.input as Record<string, unknown>).subagent_type as string;
-                              if (agentMap[cur]) {
-                                (block.input as Record<string, unknown>).subagent_type = agentMap[cur];
-                              }
-                            }
-                            delete (block.input as Record<string, unknown>).task_id;
-                            delete (block.input as Record<string, unknown>).command;
-                          }
-                          // AskUserQuestion: OpenCode uses `multiple`, Claude uses `multiSelect`.
-                          if (block.name === "AskUserQuestion" && Array.isArray((block.input as Record<string, unknown>).questions)) {
-                            for (const item of (block.input as Record<string, unknown>).questions as Array<Record<string, unknown>>) {
-                              if (typeof item.multiple === "boolean" && item.multiSelect === undefined) {
-                                item.multiSelect = item.multiple;
-                                delete item.multiple;
-                              }
-                            }
-                          }
-                          // Skill: OpenCode uses `name`, Claude uses `skill`.
-                          if (block.name === "Skill") {
-                            const input = block.input as Record<string, unknown>;
-                            if (typeof input.name === "string" && input.skill === undefined) {
-                              input.skill = input.name;
-                              delete input.name;
-                            }
-                          }
-                          // WebFetch: OpenCode uses `format`, Claude uses a freeform `prompt`.
-                          // Best-effort bridge: synthesize a prompt from the requested format.
-                          if (block.name === "WebFetch") {
-                            const input = block.input as Record<string, unknown>;
-                            if (typeof input.format === "string" && input.prompt === undefined) {
-                              const format = input.format;
-                              input.prompt = format === "text"
-                                ? "Fetch this URL and return the content as plain text."
-                                : format === "html"
-                                ? "Fetch this URL and return the raw HTML."
-                                : "Fetch this URL and return the content as markdown.";
-                              delete input.format;
-                            }
-                            delete input.timeout;
-                          }
-                          // TodoWrite: translate OpenCode fields → Claude fields
-                          // OpenCode: { content, status, priority } with status ∈ {pending, in_progress, completed, cancelled}
-                          // Claude:   { content, status, activeForm } with status ∈ {pending, in_progress, completed}
-                          if (block.name === "TodoWrite" && Array.isArray((block.input as Record<string, unknown>).todos)) {
-                            for (const item of (block.input as Record<string, unknown>).todos as Array<Record<string, unknown>>) {
-                              if (item.priority && !item.activeForm) {
-                                item.activeForm = item.priority;
-                                delete item.priority;
-                              }
-                              // Map "cancelled" → "completed" (Claude doesn't have cancelled)
-                              if (item.status === "cancelled") {
-                                item.status = "completed";
-                              }
-                            }
-                          }
                         }
                       }
                       // tool_result blocks reference tool names via tool_use_id,
@@ -714,7 +669,9 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 }
 
                 body = JSON.stringify(parsed);
-              } catch {}
+              } catch (e) {
+                debugLog("fetch: body transform failed — request will go out unmodified", e);
+              }
             }
 
             // ── URL: add ?beta=true ──
@@ -725,7 +682,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                   : input instanceof URL ? input.toString()
                   : input.url,
               );
-            } catch {}
+            } catch (e) { debugLog("fetch: URL parse failed", e); }
 
             if (requestUrl?.pathname === "/messages") {
               requestUrl.pathname = "/v1/messages";
@@ -774,122 +731,43 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             const decoder = new TextDecoder();
             const encoder = new TextEncoder();
 
-            // Track the current tool name for argument translation in
-            // streamed tool_use content_block_start / input_json_delta events.
-            let currentToolName = "";
+            // Parse SSE events on \n\n boundaries, buffer tool_use
+            // input_json_delta fragments per content-block index, and
+            // translate the assembled JSON once at content_block_stop.
+            // This avoids chunk-boundary corruption (e.g. "file_" + "path"
+            // split across TCP chunks) that regex-on-raw-bytes can't
+            // handle. See src/stream.ts for the processor implementation.
+            const processor = createSseProcessor({
+              inboundToolNameMap: INBOUND_TOOL_NAME_MAP,
+              translateToolArgs: translateToolArgsJsonString,
+              debug: (msg) => debugLog(`stream: ${msg}`),
+            });
 
             return new Response(
               new ReadableStream({
-                async pull(controller) {
-                  const { done, value } = await reader.read();
-                  if (done) { controller.close(); return; }
-                  let text = decoder.decode(value, { stream: true });
-
-                  // Map tool names: Claude Code → OpenCode
-                  text = text.replace(/"name"\s*:\s*"([^"]+)"/g, (_match, name: string) => {
-                    // Track current tool for argument translation
-                    if (SHARED_TOOL_NAMES.has(name) || STUB_TOOL_NAMES.has(name)) {
-                      currentToolName = name;
-                    }
-                    const mapped = INBOUND_TOOL_NAME_MAP[name];
-                    return mapped
-                      ? `"name": "${mapped}"`
-                      : `"name": "${name}"`;
-                  });
-
-                  // OpenCode requires a task subagent_type; Claude may omit it for
-                  // the default general-purpose agent. Seed the default at
-                  // content_block_start so later deltas can override it.
-                  if (currentToolName === "Agent" && text.includes('"content_block_start"')) {
-                    text = ensureInputStringField(text, "subagent_type", "general");
-                  }
-                  if (currentToolName === "WebFetch" && text.includes('"content_block_start"')) {
-                    text = ensureInputStringField(text, "format", "markdown");
-                  }
-
-                  // Translate snake_case argument keys to camelCase in
-                  // streamed tool input JSON. The model streams tool arguments
-                  // as partial JSON in input_json_delta events. We translate
-                  // known keys on the fly.
-                  if (currentToolName) {
-                    // file_path → filePath
-                    text = text.replace(/"file_path"\s*:/g, () => {
-                      if (currentToolName === "Edit" || currentToolName === "Read" || currentToolName === "Write") {
-                        return '"filePath":';
+                start(controller) {
+                  // Use start() with an async loop rather than pull():
+                  // Bun's ReadableStream doesn't reliably re-invoke pull()
+                  // when the handler resolves without enqueuing (which
+                  // happens while we're buffering input_json_delta
+                  // fragments), so pull() can stall the stream.
+                  (async () => {
+                    try {
+                      while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) {
+                          const tail = processor.flush();
+                          if (tail) controller.enqueue(encoder.encode(tail));
+                          controller.close();
+                          return;
+                        }
+                        const out = processor.feedChunk(decoder.decode(value, { stream: true }));
+                        if (out) controller.enqueue(encoder.encode(out));
                       }
-                      return '"file_path":';
-                    });
-                    // old_string → oldString
-                    text = text.replace(/"old_string"\s*:/g, '"oldString":');
-                    // new_string → newString
-                    text = text.replace(/"new_string"\s*:/g, '"newString":');
-                    // replace_all → replaceAll
-                    text = text.replace(/"replace_all"\s*:/g, '"replaceAll":');
-                    // glob → include (for Grep only)
-                    if (currentToolName === "Grep") {
-                      text = text.replace(/"glob"\s*:/g, '"include":');
+                    } catch (e) {
+                      controller.error(e);
                     }
-                    // TodoWrite: activeForm → priority
-                    // Claude sends { content, status, activeForm }, OpenCode
-                    // requires { content, status, priority }. Since OpenCode
-                    // validates priority as z.string() (no enum), any string
-                    // value is accepted — the activeForm text works fine.
-                    if (currentToolName === "TodoWrite") {
-                      text = text.replace(/"activeForm"\s*:/g, '"priority":');
-                    }
-                    // AskUserQuestion: multiSelect → multiple
-                    if (currentToolName === "AskUserQuestion") {
-                      text = text.replace(/"multiSelect"\s*:/g, '"multiple":');
-                    }
-                    // Agent: translate Claude's subagent_type values to OpenCode's.
-                    // Claude uses "general-purpose", "Explore", "Plan", "statusline-setup".
-                    // OpenCode has "build", "general", "explore", and "plan" agents.
-                    // We match the full key:value pair to avoid replacing these
-                    // strings inside prompt/description text.
-                    if (currentToolName === "Agent") {
-                      text = text.replace(
-                        /"subagent_type"\s*:\s*"(general-purpose|statusline-setup|Explore|Plan)"/g,
-                        (_m, val: string) => {
-                          const map: Record<string, string> = {
-                            "general-purpose": "general",
-                            "statusline-setup": "build",
-                            "Explore": "explore",
-                            "Plan": "plan",
-                          };
-                          return `"subagent_type": "${map[val] || val}"`;
-                        },
-                      );
-                      text = stripScalarJsonField(text, "model");
-                      text = stripScalarJsonField(text, "run_in_background");
-                      text = stripScalarJsonField(text, "isolation");
-                    }
-                    if (currentToolName === "Bash") {
-                      text = stripScalarJsonField(text, "run_in_background");
-                      text = stripScalarJsonField(text, "dangerouslyDisableSandbox");
-                    }
-                    if (currentToolName === "Read") {
-                      text = stripScalarJsonField(text, "pages");
-                    }
-                    if (currentToolName === "Grep") {
-                      for (const field of ["output_mode", "-B", "-A", "-C", "context", "-n", "-i", "type", "head_limit", "offset", "multiline"]) {
-                        text = stripScalarJsonField(text, field);
-                      }
-                    }
-                    if (currentToolName === "Skill") {
-                      text = text.replace(/"skill"\s*:/g, '"name":');
-                      text = stripScalarJsonField(text, "args");
-                    }
-                    if (currentToolName === "WebFetch") {
-                      text = stripScalarJsonField(text, "prompt");
-                    }
-                  }
-
-                  // Reset tool name tracking on content_block_stop
-                  if (text.includes('"content_block_stop"')) {
-                    currentToolName = "";
-                  }
-
-                  controller.enqueue(encoder.encode(text));
+                  })();
                 },
               }),
               { status: response.status, statusText: response.statusText, headers: response.headers },
