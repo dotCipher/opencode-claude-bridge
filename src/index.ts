@@ -158,23 +158,6 @@ type PluginClient = {
 const CLAUDE_PREFIX =
   "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 
-/**
- * Diagnostic logger gated by OPENCODE_CLAUDE_BRIDGE_DEBUG=1.
- *
- * The bridge defensively swallows errors in optional-feature paths
- * (fingerprint, profile fetch, keychain bootstrap, OAuth browser open,
- * body transform) so that a transient failure never breaks the actual
- * request. Silence is fine for the happy path but kills diagnosability
- * when a user reports "tools don't work" — set the env var to route
- * those errors to stderr.
- */
-const DEBUG = process.env.OPENCODE_CLAUDE_BRIDGE_DEBUG === "1";
-function debugLog(msg: string, err?: unknown): void {
-  if (!DEBUG) return;
-  const suffix = err instanceof Error ? `: ${err.message}` : err !== undefined ? `: ${String(err)}` : "";
-  console.error(`[opencode-claude-bridge] ${msg}${suffix}`);
-}
-
 const oauthProfileCache = new Map<string, Promise<OAuthProfile | null>>();
 const SYSTEM_PROMPT_CACHE_PATH = process.env.ANTHROPIC_SYSTEM_PROMPT_PATH
   || join(process.env.HOME || "", ".cache", "opencode-claude-bridge", "claude-system-prompt.json");
@@ -207,12 +190,12 @@ async function refreshAuth(
   try {
     const kt = getClaudeTokens();
     if (kt && kt.expires > Date.now() + 60_000) fresh = kt;
-  } catch (e) { debugLog("refreshAuth: keychain read failed", e); }
+  } catch {}
 
   // Layer 2: Stored refresh token
   if (!fresh && auth.refresh) {
     try { fresh = refreshTokens(auth.refresh); }
-    catch (e) { debugLog("refreshAuth: stored refresh token failed", e); }
+    catch {}
   }
 
   // Layer 3: CLI refresh token
@@ -221,7 +204,7 @@ async function refreshAuth(
       const creds = readClaudeCredentials();
       if (creds?.claudeAiOauth?.refreshToken)
         fresh = refreshTokens(creds.claudeAiOauth.refreshToken);
-    } catch (e) { debugLog("refreshAuth: CLI refresh token failed", e); }
+    } catch {}
   }
 
   if (fresh) {
@@ -248,11 +231,11 @@ function openBrowser(url: string): void {
       ];
       for (const [name, attempt] of attempts) {
         try { attempt(); break; }
-        catch (e) { debugLog(`openBrowser: ${name} failed`, e); }
+        catch {}
       }
     } else if (process.platform === "win32") {
       try { execFileSync("cmd", ["/c", "start", "", url], { timeout: 3000 }); }
-      catch (e) { debugLog("openBrowser: cmd start failed", e); }
+      catch {}
     } else {
       const attempts: Array<[string, () => void]> = [
         ["xdg-open", () => execFileSync("/usr/bin/xdg-open", [url], { timeout: 3000 })],
@@ -260,10 +243,10 @@ function openBrowser(url: string): void {
       ];
       for (const [name, attempt] of attempts) {
         try { attempt(); break; }
-        catch (e) { debugLog(`openBrowser: ${name} failed`, e); }
+        catch {}
       }
     }
-  })().catch((e) => debugLog("openBrowser: IIFE rejected", e));
+  })().catch(() => {});
 }
 
 /** Merge HeadersInit (Headers | string[][] | Record) onto a Headers object. */
@@ -359,12 +342,7 @@ function readCachedClaudePromptCache(): ClaudeSystemPromptCache | null {
     const parsed = JSON.parse(raw) as ClaudeSystemPromptCache;
     if (!Array.isArray(parsed.system) || parsed.system.length === 0) return null;
     return parsed;
-  } catch (e) {
-    // File-not-found is the expected case on a fresh install — only log
-    // other errors (permissions, malformed JSON).
-    if (e instanceof Error && !e.message.includes("ENOENT")) {
-      debugLog("readCachedClaudePromptCache failed", e);
-    }
+  } catch {
     return null;
   }
 }
@@ -373,13 +351,10 @@ function getStableDeviceId(): string {
   let who = "unknown";
   try {
     who = `${userInfo().username}@${hostname()}`;
-  } catch (e) {
-    debugLog("getStableDeviceId: userInfo/hostname failed, falling back to env", e);
+  } catch {
     try {
       who = `${process.env.USER || process.env.USERNAME || "unknown"}@${hostname()}`;
-    } catch (e2) {
-      debugLog("getStableDeviceId: env fallback failed, using 'unknown'", e2);
-    }
+    } catch {}
   }
   return createHash("sha256").update(who).digest("hex");
 }
@@ -418,8 +393,7 @@ async function fetchOAuthProfile(accessToken: string): Promise<OAuthProfile | nu
       });
       if (!response.ok) return null;
       return await response.json() as OAuthProfile;
-    } catch (e) {
-      debugLog("fetchOAuthProfile failed", e);
+    } catch {
       return null;
     }
   })();
@@ -445,7 +419,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
   try {
     const tokens = getClaudeTokens();
     if (tokens) await storeAuth(client, tokens);
-  } catch (e) { debugLog("init: keychain bootstrap failed", e); }
+  } catch {}
 
   return {
     "experimental.chat.system.transform": (
@@ -486,7 +460,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
               await storeAuth(client, tokens);
               auth = { type: "oauth", ...tokens };
             }
-          } catch (e) { debugLog("loader: keychain auto-bootstrap failed", e); }
+          } catch {}
         }
 
         // API key mode — set the key in env and let the SDK handle everything
@@ -669,9 +643,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 }
 
                 body = JSON.stringify(parsed);
-              } catch (e) {
-                debugLog("fetch: body transform failed — request will go out unmodified", e);
-              }
+              } catch {}
             }
 
             // ── URL: add ?beta=true ──
@@ -682,7 +654,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                   : input instanceof URL ? input.toString()
                   : input.url,
               );
-            } catch (e) { debugLog("fetch: URL parse failed", e); }
+            } catch {}
 
             if (requestUrl?.pathname === "/messages") {
               requestUrl.pathname = "/v1/messages";
@@ -740,7 +712,6 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             const processor = createSseProcessor({
               inboundToolNameMap: INBOUND_TOOL_NAME_MAP,
               translateToolArgs: translateToolArgsJsonString,
-              debug: (msg) => debugLog(`stream: ${msg}`),
             });
 
             return new Response(
