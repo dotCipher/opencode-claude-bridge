@@ -19,6 +19,10 @@ import {
 } from "./claude-tools.js";
 import { extractOAuthErrorDetail } from "./oauth.js";
 import { createSseProcessor, parseSseEvent, buildSseEvent } from "./stream.js";
+import {
+  deriveModelDisplayName,
+  rewriteSystemBlocksForModel,
+} from "./index.js";
 
 // ── Helpers (extracted / reimplemented from index.ts for unit testing) ────────
 
@@ -924,5 +928,62 @@ describe("parseSseEvent / buildSseEvent round trip", () => {
   it("handles a data-only frame (no event line)", () => {
     const parsed = parseSseEvent('data: {"ok":true}\n\n');
     assert.deepEqual(parsed, { event: null, data: '{"ok":true}' });
+  });
+});
+
+describe("deriveModelDisplayName", () => {
+  it("parses claude-opus-4-7 → Opus 4.7", () => {
+    assert.equal(deriveModelDisplayName("claude-opus-4-7"), "Opus 4.7");
+  });
+
+  it("parses claude-sonnet-4-6 → Sonnet 4.6", () => {
+    assert.equal(deriveModelDisplayName("claude-sonnet-4-6"), "Sonnet 4.6");
+  });
+
+  it("ignores a trailing date suffix (claude-haiku-4-5-20251001 → Haiku 4.5)", () => {
+    assert.equal(deriveModelDisplayName("claude-haiku-4-5-20251001"), "Haiku 4.5");
+  });
+
+  it("falls back to the raw id when the convention doesn't match", () => {
+    assert.equal(deriveModelDisplayName("weird-custom-model"), "weird-custom-model");
+    assert.equal(deriveModelDisplayName("claude-3-5-sonnet-20241022"), "claude-3-5-sonnet-20241022");
+  });
+});
+
+describe("rewriteSystemBlocksForModel", () => {
+  const sourceBlock = {
+    type: "text",
+    text:
+      "You are a Claude agent, built on Anthropic's Claude Agent SDK.\n" +
+      " - You are powered by the model named Sonnet 4.6. The exact model ID is claude-sonnet-4-6.\n" +
+      " - Assistant knowledge cutoff is August 2025.",
+  };
+
+  it("rewrites the identity line to match the requested model", () => {
+    const [out] = rewriteSystemBlocksForModel([sourceBlock], "claude-opus-4-7");
+    assert.ok(out.text?.includes("named Opus 4.7"));
+    assert.ok(out.text?.includes("claude-opus-4-7"));
+    assert.ok(!out.text?.includes("Sonnet 4.6"));
+    assert.ok(!out.text?.includes("claude-sonnet-4-6"));
+  });
+
+  it("leaves blocks untouched when no model id is provided", () => {
+    const [out] = rewriteSystemBlocksForModel([sourceBlock], undefined);
+    assert.equal(out, sourceBlock);
+  });
+
+  it("handles a dated variant without re-including the date suffix in the display name", () => {
+    const [out] = rewriteSystemBlocksForModel([sourceBlock], "claude-haiku-4-5-20251001");
+    assert.ok(out.text?.includes("named Haiku 4.5"));
+    assert.ok(out.text?.includes("The exact model ID is claude-haiku-4-5-20251001."));
+  });
+
+  it("preserves non-text blocks and non-matching text", () => {
+    const nonText = { type: "other", text: "unchanged" };
+    const noMatch = { type: "text", text: "no identity line here" };
+    const blocks = [nonText, noMatch];
+    const out = rewriteSystemBlocksForModel(blocks, "claude-opus-4-7");
+    assert.deepEqual(out[0], nonText);
+    assert.equal(out[1].text, "no identity line here");
   });
 });
