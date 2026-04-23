@@ -18,6 +18,7 @@ import {
   shouldUseClaudeToolSchemas,
 } from "./claude-tools.js";
 import { extractOAuthErrorDetail } from "./oauth.js";
+import { shouldInjectClaudeTools } from "./index.js";
 import { createSseProcessor, parseSseEvent, buildSseEvent } from "./stream.js";
 import {
   deriveModelDisplayName,
@@ -178,6 +179,27 @@ describe("tool schema selection", () => {
     assert.equal(shouldUseClaudeToolSchemas({
       model: "gpt-4o-mini",
       requestUrl: "https://api.openai.com/v1/responses",
+    }), false);
+  });
+
+  it("injects Claude tool schemas only when active tools are present", () => {
+    assert.equal(shouldInjectClaudeTools({
+      model: "claude-sonnet-4-6",
+      requestUrl: "https://api.anthropic.com/v1/messages",
+      tools: [{ name: "bash" }],
+    }), true);
+  });
+
+  it("does not inject Claude tool schemas for tool-less summary or compaction requests", () => {
+    assert.equal(shouldInjectClaudeTools({
+      model: "claude-sonnet-4-6",
+      requestUrl: "https://api.anthropic.com/v1/messages",
+      tools: [],
+    }), false);
+    assert.equal(shouldInjectClaudeTools({
+      model: "claude-sonnet-4-6",
+      requestUrl: "https://api.anthropic.com/v1/messages",
+      tools: undefined,
     }), false);
   });
 });

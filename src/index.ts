@@ -205,6 +205,17 @@ export function rewriteSystemBlocksForModel(
   });
 }
 
+export function shouldInjectClaudeTools(input: {
+  model?: string;
+  requestUrl?: string;
+  tools?: unknown;
+}): boolean {
+  if (!shouldUseClaudeToolSchemas({ model: input.model, requestUrl: input.requestUrl })) {
+    return false;
+  }
+  return Array.isArray(input.tools) && input.tools.length > 0;
+}
+
 const oauthProfileCache = new Map<string, Promise<OAuthProfile | null>>();
 const SYSTEM_PROMPT_CACHE_PATH = process.env.ANTHROPIC_SYSTEM_PROMPT_PATH
   || join(process.env.HOME || "", ".cache", "opencode-claude-bridge", "claude-system-prompt.json");
@@ -711,7 +722,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 // Claude wire schemas are only useful for Anthropic-native
                 // requests or Claude-family models on Anthropic-compatible
                 // routers such as OpenRouter.
-                if (shouldUseClaudeToolSchemas({ model: parsed.model, requestUrl })) {
+                if (shouldInjectClaudeTools({ model: parsed.model, requestUrl, tools: parsed.tools })) {
                   parsed.tools = getClaudeTools();
                 }
                 delete parsed.tool_choice;
