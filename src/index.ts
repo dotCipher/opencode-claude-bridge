@@ -159,6 +159,52 @@ type PluginClient = {
 const CLAUDE_PREFIX =
   "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 
+/**
+ * Derive a human-readable display name from a Claude model ID.
+ *
+ * Matches `claude-{family}-{major}-{minor}[-{date}]` (the convention used
+ * for every Claude model family to date) and renders e.g.
+ *   claude-opus-4-7            -> "Opus 4.7"
+ *   claude-haiku-4-5-20251001  -> "Haiku 4.5"
+ *   claude-sonnet-4-6          -> "Sonnet 4.6"
+ *
+ * Falls back to the raw model ID if the convention doesn't match, so future
+ * naming changes are surfaced truthfully instead of silently wrong.
+ */
+export function deriveModelDisplayName(modelId: string): string {
+  const m = modelId.match(/^claude-([a-z]+)-(\d+)-(\d+)(?:-\d+)?$/i);
+  if (!m) return modelId;
+  const [, family, major, minor] = m;
+  const capitalized = family.charAt(0).toUpperCase() + family.slice(1).toLowerCase();
+  return `${capitalized} ${major}.${minor}`;
+}
+
+/**
+ * Rewrite model-identity lines inside the cached Claude Code system prompt
+ * so they reflect the model actually being requested. Without this, every
+ * request (regardless of selected model) gets a system prompt claiming
+ * "You are powered by the model named Sonnet 4.6", which can bias behavior.
+ */
+export function rewriteSystemBlocksForModel(
+  blocks: Array<{ type?: string; text?: string }>,
+  modelId: string | undefined,
+): Array<{ type?: string; text?: string }> {
+  if (!modelId) return blocks;
+  const display = deriveModelDisplayName(modelId);
+
+  return blocks.map((block) => {
+    if (block?.type !== "text" || typeof block.text !== "string") return block;
+    let text = block.text;
+
+    text = text.replace(
+      /You are powered by the model named [^\n]+? The exact model ID is [a-z0-9.-]+\./g,
+      `You are powered by the model named ${display}. The exact model ID is ${modelId}.`,
+    );
+
+    return { ...block, text };
+  });
+}
+
 const oauthProfileCache = new Map<string, Promise<OAuthProfile | null>>();
 const SYSTEM_PROMPT_CACHE_PATH = process.env.ANTHROPIC_SYSTEM_PROMPT_PATH
   || join(process.env.HOME || "", ".cache", "opencode-claude-bridge", "claude-system-prompt.json");
@@ -648,9 +694,13 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
 
                 // If we have a locally captured Claude Code system prompt, prefer it.
                 if (cachedClaudeSystem) {
+                  const rewritten = rewriteSystemBlocksForModel(
+                    cachedClaudeSystem,
+                    typeof parsed.model === "string" ? parsed.model : undefined,
+                  );
                   parsed.system = [
                     { type: "text", text: billingHeader },
-                    ...cachedClaudeSystem,
+                    ...rewritten,
                   ];
                 } else if (parsed.system && Array.isArray(parsed.system)) {
                   // Otherwise keep the existing prompt but shape it closer to Claude Code.
