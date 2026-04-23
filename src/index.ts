@@ -163,6 +163,27 @@ const oauthProfileCache = new Map<string, Promise<OAuthProfile | null>>();
 const SYSTEM_PROMPT_CACHE_PATH = process.env.ANTHROPIC_SYSTEM_PROMPT_PATH
   || join(process.env.HOME || "", ".cache", "opencode-claude-bridge", "claude-system-prompt.json");
 
+function buildAuthFailureResponse(detail: string): Response {
+  const message = [
+    "Claude OAuth credentials are no longer valid.",
+    detail,
+    "Reconnect 'Claude Pro / Max (OAuth)' in OpenCode or run `claude login` again.",
+  ].filter(Boolean).join(" ");
+
+  return new Response(JSON.stringify({
+    type: "error",
+    error: {
+      type: "authentication_error",
+      message,
+    },
+  }), {
+    status: 401,
+    headers: {
+      "content-type": "application/json",
+    },
+  });
+}
+
 /** Persist fresh tokens to OpenCode's auth store. */
 async function storeAuth(
   client: PluginClient,
@@ -186,17 +207,20 @@ async function refreshAuth(
 ): Promise<string | null> {
   type Tokens = { access: string; refresh: string; expires: number };
   let fresh: Tokens | null = null;
+  const errors: string[] = [];
 
   // Layer 1: Claude CLI keychain
   try {
     const kt = getClaudeTokens();
     if (kt && kt.expires > Date.now() + 60_000) fresh = kt;
-  } catch {}
+  } catch (err) {
+    errors.push(String(err));
+  }
 
   // Layer 2: Stored refresh token
   if (!fresh && auth.refresh) {
     try { fresh = refreshTokens(auth.refresh); }
-    catch {}
+    catch (err) { errors.push(String(err)); }
   }
 
   // Layer 3: CLI refresh token
@@ -205,7 +229,9 @@ async function refreshAuth(
       const creds = readClaudeCredentials();
       if (creds?.claudeAiOauth?.refreshToken)
         fresh = refreshTokens(creds.claudeAiOauth.refreshToken);
-    } catch {}
+    } catch (err) {
+      errors.push(String(err));
+    }
   }
 
   if (fresh) {
@@ -215,6 +241,11 @@ async function refreshAuth(
     auth.expires = fresh.expires;
     return fresh.access;
   }
+
+  if (errors.length > 0) {
+    throw new Error(errors[errors.length - 1]);
+  }
+
   return null;
 }
 
@@ -488,8 +519,19 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             const auth = await getAuth();
             if (auth.type !== "oauth") return fetch(input, init);
 
-            if (!auth.access || !auth.expires || auth.expires < Date.now()) {
-              await refreshAuth(auth, client);
+            let accessToken = auth.access || null;
+            if (!accessToken || !auth.expires || auth.expires < Date.now()) {
+              try {
+                accessToken = await refreshAuth(auth, client);
+              } catch (err) {
+                const detail = err instanceof Error ? err.message : String(err);
+                console.error(`[opencode-claude-bridge] OAuth refresh failed: ${detail}`);
+                return buildAuthFailureResponse(detail);
+              }
+            }
+
+            if (!accessToken) {
+              return buildAuthFailureResponse("No usable OAuth access token is available.");
             }
 
             // ── Headers ──
@@ -497,7 +539,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             if (input instanceof Request) mergeHeaders(headers, input.headers);
             if (init?.headers) mergeHeaders(headers, init.headers);
 
-            headers.set("authorization", `Bearer ${auth.access}`);
+            headers.set("authorization", `Bearer ${accessToken}`);
             headers.delete("x-api-key");
             headers.delete("x-session-affinity");
             if (!headers.has("accept")) headers.set("accept", "application/json");
@@ -697,7 +739,14 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             if (response.status === 429) {
               for (let retry = 0; retry < 2; retry++) {
                 console.error(`[opencode-claude-bridge] 429 rate limited (attempt ${retry + 1}/2), refreshing token...`);
-                const freshToken = await refreshAuth(auth, client);
+                let freshToken: string | null = null;
+                try {
+                  freshToken = await refreshAuth(auth, client);
+                } catch (err) {
+                  const detail = err instanceof Error ? err.message : String(err);
+                  console.error(`[opencode-claude-bridge] OAuth refresh failed after 429: ${detail}`);
+                  return buildAuthFailureResponse(detail);
+                }
                 if (!freshToken) {
                   console.error("[opencode-claude-bridge] Token refresh failed, returning 429");
                   break;

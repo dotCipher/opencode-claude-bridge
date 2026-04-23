@@ -17,6 +17,7 @@ import {
   AGENT_TYPE_OPENCODE_TO_CLAUDE,
   shouldUseClaudeToolSchemas,
 } from "./claude-tools.js";
+import { extractOAuthErrorDetail } from "./oauth.js";
 import { createSseProcessor, parseSseEvent, buildSseEvent } from "./stream.js";
 
 // ── Helpers (extracted / reimplemented from index.ts for unit testing) ────────
@@ -127,6 +128,23 @@ describe("temperature coercion", () => {
       JSON.stringify({ model: "claude-sonnet-4-6", messages: [] }),
     );
     assert.equal(out.temperature, undefined);
+  });
+});
+
+describe("OAuth error parsing", () => {
+  it("extracts nested error messages from token responses", () => {
+    const detail = extractOAuthErrorDetail(JSON.stringify({
+      error: {
+        type: "invalid_request_error",
+        message: "invalid_grant: refresh token not found or invalid",
+      },
+    }));
+    assert.equal(detail, "invalid_grant: refresh token not found or invalid");
+  });
+
+  it("falls back to raw response bodies when parsing fails", () => {
+    const detail = extractOAuthErrorDetail("plain failure body");
+    assert.equal(detail, "plain failure body");
   });
 });
 

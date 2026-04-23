@@ -103,9 +103,26 @@ function curlPost(
   };
 }
 
+export function extractOAuthErrorDetail(body: string): string {
+  try {
+    const parsed = JSON.parse(body) as {
+      error?: { message?: string; type?: string } | string;
+      error_description?: string;
+      message?: string;
+    };
+    if (typeof parsed.error === "string" && parsed.error.trim()) return parsed.error.trim();
+    if (parsed.error && typeof parsed.error === "object" && parsed.error.message?.trim()) {
+      return parsed.error.message.trim();
+    }
+    if (parsed.error_description?.trim()) return parsed.error_description.trim();
+    if (parsed.message?.trim()) return parsed.message.trim();
+  } catch {}
+  return body.trim();
+}
+
 function parseTokenResponse(status: number, body: string, label: string): OAuthTokens {
   if (status !== 200) {
-    throw new Error(`${label} failed (${status}): ${body}`);
+    throw new Error(`${label} failed (${status}): ${extractOAuthErrorDetail(body)}`);
   }
   const data = JSON.parse(body) as {
     access_token: string;
