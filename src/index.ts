@@ -388,6 +388,17 @@ function maybeUnquoteText(text: string): string {
   return text;
 }
 
+export function stripAssistantPrefillForClaude(
+  messages: Array<{ role?: string; content?: unknown }>,
+): Array<{ role?: string; content?: unknown }> {
+  if (messages.length === 0) return messages;
+  const last = messages[messages.length - 1];
+  if (last?.role !== "assistant") return messages;
+  if (typeof last.content !== "string") return messages;
+  if (last.content.trim() !== "Continue with your tasks.") return messages;
+  return messages.slice(0, -1);
+}
+
 function normalizeSystemBlocks(
   system: Array<{ type?: string; text?: string }>,
 ): Array<{ type?: string; text?: string }> {
@@ -652,6 +663,9 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 }
 
                 if (!parsed.system) parsed.system = [];
+                if (Array.isArray(parsed.messages)) {
+                  parsed.messages = stripAssistantPrefillForClaude(parsed.messages);
+                }
                 // context_management and output_config.effort are only
                 // supported by thinking-capable models. Sending them to
                 // haiku (used for title generation) produces a 400.

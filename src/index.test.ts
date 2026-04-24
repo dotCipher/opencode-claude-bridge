@@ -18,7 +18,7 @@ import {
   shouldUseClaudeToolSchemas,
 } from "./claude-tools.js";
 import { extractOAuthErrorDetail } from "./oauth.js";
-import { shouldInjectClaudeTools } from "./index.js";
+import { shouldInjectClaudeTools, stripAssistantPrefillForClaude } from "./index.js";
 import { createSseProcessor, parseSseEvent, buildSseEvent } from "./stream.js";
 import {
   deriveModelDisplayName,
@@ -150,6 +150,26 @@ describe("OAuth error parsing", () => {
   it("falls back to raw response bodies when parsing fails", () => {
     const detail = extractOAuthErrorDetail("plain failure body");
     assert.equal(detail, "plain failure body");
+  });
+});
+
+describe("Claude assistant prefill stripping", () => {
+  it("strips the synthetic continue prefill so Anthropic requests end with a user message", () => {
+    const out = stripAssistantPrefillForClaude([
+      { role: "user", content: [{ type: "text", text: "hello" }] },
+      { role: "assistant", content: "Continue with your tasks." },
+    ]);
+    assert.deepEqual(out, [
+      { role: "user", content: [{ type: "text", text: "hello" }] },
+    ]);
+  });
+
+  it("keeps non-synthetic assistant messages intact", () => {
+    const input = [
+      { role: "user", content: [{ type: "text", text: "hello" }] },
+      { role: "assistant", content: "Real assistant content" },
+    ];
+    assert.deepEqual(stripAssistantPrefillForClaude(input), input);
   });
 });
 
