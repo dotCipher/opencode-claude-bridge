@@ -513,6 +513,18 @@ describe("translateArgsOpencodeToClaude", () => {
     });
   });
 
+  it("maps plan_enter → EnterPlanMode with empty args (outbound)", () => {
+    const out = translateArgsOpencodeToClaude("EnterPlanMode", {});
+    assert.deepEqual(out, {});
+  });
+
+  it("maps plan_exit → ExitPlanMode preserving allowedPrompts (outbound)", () => {
+    const out = translateArgsOpencodeToClaude("ExitPlanMode", {
+      allowedPrompts: [{ tool: "Bash", prompt: "run tests" }],
+    });
+    assert.deepEqual(out, { allowedPrompts: [{ tool: "Bash", prompt: "run tests" }] });
+  });
+
   it("is the inverse of translateToolArgsJsonString for the Edit round trip", () => {
     // Round-trip: Claude inbound → OpenCode → Claude outbound should be identity
     // for keys that have a bidirectional mapping.
@@ -555,6 +567,8 @@ const INBOUND_TOOL_NAME_MAP: Record<string, string> = {
   TodoWrite: "todowrite",
   Skill: "skill",
   AskUserQuestion: "question",
+  EnterPlanMode: "plan_enter",
+  ExitPlanMode: "plan_exit",
 };
 
 function makeProcessor(opts: { debug?: (msg: string) => void } = {}) {
@@ -719,6 +733,22 @@ describe("SSE processor: argument translation", () => {
   it("leaves Bash args untouched", () => {
     const out = runToolUse("Bash", ['{"command": "echo hello"}']);
     assert.deepEqual(finalToolArgs(out, 1), { command: "echo hello" });
+  });
+
+  it("maps EnterPlanMode → plan_enter with empty args", () => {
+    const out = runToolUse("EnterPlanMode", ['{}']);
+    assert.equal(toolUseStartName(out, 1), "plan_enter");
+    assert.deepEqual(finalToolArgs(out, 1), {});
+  });
+
+  it("maps ExitPlanMode → plan_exit preserving allowedPrompts", () => {
+    const out = runToolUse("ExitPlanMode", [
+      '{"allowedPrompts":[{"tool":"Bash","prompt":"run tests"}]}',
+    ]);
+    assert.equal(toolUseStartName(out, 1), "plan_exit");
+    assert.deepEqual(finalToolArgs(out, 1), {
+      allowedPrompts: [{ tool: "Bash", prompt: "run tests" }],
+    });
   });
 });
 

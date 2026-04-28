@@ -91,6 +91,8 @@ const OUTBOUND_TOOL_NAME_MAP: Record<string, string> = {
   mcp_skill: "Skill",
   question: "AskUserQuestion",
   mcp_question: "AskUserQuestion",
+  plan_enter: "EnterPlanMode",
+  plan_exit: "ExitPlanMode",
 };
 
 const INBOUND_TOOL_NAME_MAP: Record<string, string> = {
@@ -105,6 +107,8 @@ const INBOUND_TOOL_NAME_MAP: Record<string, string> = {
   TodoWrite: "todowrite",
   Skill: "skill",
   AskUserQuestion: "question",
+  EnterPlanMode: "plan_enter",
+  ExitPlanMode: "plan_exit",
 };
 
 const ANTHROPIC_MODELS: Record<string, ProviderModel> = {
