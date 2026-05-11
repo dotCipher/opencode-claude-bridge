@@ -235,6 +235,14 @@ export function translateToolArgsJsonString(json: string, toolName: string): str
     const mapped = AGENT_TYPE_CLAUDE_TO_OPENCODE[out.subagent_type];
     if (mapped) out.subagent_type = mapped;
   }
+  if (toolName === "AskUserQuestion" && typeof out.questions === "string") {
+    try {
+      const parsed = JSON.parse(out.questions);
+      if (Array.isArray(parsed)) out.questions = parsed;
+    } catch {
+      // Leave invalid strings untouched so OpenCode surfaces a schema error.
+    }
+  }
   if (toolName === "AskUserQuestion" && Array.isArray(out.questions)) {
     // Claude uses "multiSelect", OpenCode's question tool uses "multiple".
     for (const item of out.questions as Array<Record<string, unknown>>) {

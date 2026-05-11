@@ -405,6 +405,35 @@ describe("translateToolArgsJsonString", () => {
       ],
     });
   });
+
+  it("parses stringified AskUserQuestion questions and translates multiSelect", () => {
+    const out = translated("AskUserQuestion", {
+      questions: JSON.stringify([
+        {
+          header: "Slack secret fix",
+          question: "SLACK_WEBHOOK_URL is missing. How do you want to handle it?",
+          options: [
+            { label: "Set manually now", description: "Paste the webhook URL now." },
+            { label: "IaC it properly now", description: "Wire the secret through IaC." },
+          ],
+          multiSelect: false,
+        },
+      ]),
+    });
+    assert.deepEqual(out, {
+      questions: [
+        {
+          header: "Slack secret fix",
+          question: "SLACK_WEBHOOK_URL is missing. How do you want to handle it?",
+          options: [
+            { label: "Set manually now", description: "Paste the webhook URL now." },
+            { label: "IaC it properly now", description: "Wire the secret through IaC." },
+          ],
+          multiple: false,
+        },
+      ],
+    });
+  });
 });
 
 // ── translateArgsOpencodeToClaude: outbound translation on parsed objects ───
