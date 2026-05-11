@@ -18,7 +18,7 @@ import {
   shouldUseClaudeToolSchemas,
 } from "./claude-tools.js";
 import { extractOAuthErrorDetail } from "./oauth.js";
-import { shouldInjectClaudeTools, stripAssistantPrefillForClaude } from "./index.js";
+import { getClaudeToolsForActiveOpenCodeTools, shouldInjectClaudeTools, stripAssistantPrefillForClaude } from "./index.js";
 import { createSseProcessor, parseSseEvent, buildSseEvent } from "./stream.js";
 import {
   deriveModelDisplayName,
@@ -221,6 +221,31 @@ describe("tool schema selection", () => {
       requestUrl: "https://api.anthropic.com/v1/messages",
       tools: undefined,
     }), false);
+  });
+
+  it("filters Claude tool schemas to tools active in the OpenCode request", () => {
+    const out = getClaudeToolsForActiveOpenCodeTools([
+      { name: "bash" },
+      { name: "webfetch" },
+      { name: "question" },
+    ]).map((tool) => tool.name).sort();
+    assert.deepEqual(out, ["AskUserQuestion", "Bash", "WebFetch"]);
+  });
+
+  it("does not advertise WebSearch when only a custom websearch_cited tool is active", () => {
+    const out = getClaudeToolsForActiveOpenCodeTools([
+      { name: "webfetch" },
+      { name: "websearch_cited" },
+    ]).map((tool) => tool.name).sort();
+    assert.deepEqual(out, ["WebFetch"]);
+  });
+
+  it("does not advertise AskUserQuestion when OpenCode did not enable question", () => {
+    const out = getClaudeToolsForActiveOpenCodeTools([
+      { name: "bash" },
+      { name: "read" },
+    ]).map((tool) => tool.name).sort();
+    assert.deepEqual(out, ["Bash", "Read"]);
   });
 });
 

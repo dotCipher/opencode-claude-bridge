@@ -220,6 +220,23 @@ export function shouldInjectClaudeTools(input: {
   return Array.isArray(input.tools) && input.tools.length > 0;
 }
 
+export function getClaudeToolsForActiveOpenCodeTools(
+  tools: unknown,
+): ReturnType<typeof getClaudeTools> {
+  if (!Array.isArray(tools)) return [];
+  const activeClaudeNames = new Set(
+    tools
+      .map((tool) => {
+        if (!tool || typeof tool !== "object") return undefined;
+        const name = (tool as { name?: unknown }).name;
+        if (typeof name !== "string") return undefined;
+        return OUTBOUND_TOOL_NAME_MAP[name] || name;
+      })
+      .filter((name): name is string => typeof name === "string"),
+  );
+  return getClaudeTools().filter((tool) => activeClaudeNames.has(tool.name));
+}
+
 const oauthProfileCache = new Map<string, Promise<OAuthProfile | null>>();
 const SYSTEM_PROMPT_CACHE_PATH = process.env.ANTHROPIC_SYSTEM_PROMPT_PATH
   || join(process.env.HOME || "", ".cache", "opencode-claude-bridge", "claude-system-prompt.json");
@@ -741,7 +758,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 // requests or Claude-family models on Anthropic-compatible
                 // routers such as OpenRouter.
                 if (shouldInjectClaudeTools({ model: parsed.model, requestUrl, tools: parsed.tools })) {
-                  parsed.tools = getClaudeTools();
+                  parsed.tools = getClaudeToolsForActiveOpenCodeTools(parsed.tools);
                 }
                 delete parsed.tool_choice;
 
