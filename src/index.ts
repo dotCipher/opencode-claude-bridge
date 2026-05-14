@@ -738,7 +738,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                   billingHeader = parsed.system[0]?.text || billingHeader;
                 }
 
-// Merge Claude Code system prompt with opencode's existing system (including AGENTS.md).
+                // Merge Claude Code system prompt with opencode's existing system (including AGENTS.md).
                 if (cachedClaudeSystem) {
                   const rewritten = rewriteSystemBlocksForModel(
                     cachedClaudeSystem,
