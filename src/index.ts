@@ -213,7 +213,7 @@ export function shouldInjectClaudeTools(input: {
   model?: string;
   requestUrl?: string;
   tools?: unknown;
-})g boolean {
+}): boolean {
   if (!shouldUseClaudeToolSchemas({ model: input.model, requestUrl: input.requestUrl })) {
     return false;
   }
