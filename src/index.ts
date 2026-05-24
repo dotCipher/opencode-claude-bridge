@@ -33,6 +33,7 @@ import {
   extractFirstUserMessageText,
   shouldUseClaudeToolSchemas,
 } from "./claude-tools.js";
+import type { ToolDefinition } from "./claude-tools.js";
 import { createSseProcessor } from "./stream.js";
 
 // ── Types ──────────────────────────────────────────────────────────
@@ -79,18 +80,23 @@ const OUTBOUND_TOOL_NAME_MAP: Record<string, string> = {
   webfetch: "WebFetch",
   todowrite: "TodoWrite",
   skill: "Skill",
-  mcp_bash: "Bash",
-  mcp_read: "Read",
-  mcp_glob: "Glob",
-  mcp_grep: "Grep",
-  mcp_edit: "Edit",
-  mcp_write: "Write",
-  mcp_task: "Agent",
-  mcp_webfetch: "WebFetch",
-  mcp_todowrite: "TodoWrite",
-  mcp_skill: "Skill",
   question: "AskUserQuestion",
-  mcp_question: "AskUserQuestion",
+  plan_enter: "EnterPlanMode",
+  plan_exit: "ExitPlanMode",
+};
+
+const ACTIVE_TOOL_SCHEMA_NAME_MAP: Record<string, string> = {
+  bash: "Bash",
+  read: "Read",
+  glob: "Glob",
+  grep: "Grep",
+  edit: "Edit",
+  write: "Write",
+  task: "Agent",
+  webfetch: "WebFetch",
+  todowrite: "TodoWrite",
+  skill: "Skill",
+  question: "AskUserQuestion",
   plan_enter: "EnterPlanMode",
   plan_exit: "ExitPlanMode",
 };
@@ -220,21 +226,68 @@ export function shouldInjectClaudeTools(input: {
   return Array.isArray(input.tools) && input.tools.length > 0;
 }
 
+function getToolName(tool: unknown): string | undefined {
+  if (!tool || typeof tool !== "object") return undefined;
+  const name = (tool as { name?: unknown }).name;
+  return typeof name === "string" ? name : undefined;
+}
+
+function getToolInputSchema(tool: unknown): Record<string, unknown> | undefined {
+  if (!tool || typeof tool !== "object") return undefined;
+  const inputSchema = (tool as { input_schema?: unknown }).input_schema;
+  if (!inputSchema || typeof inputSchema !== "object" || Array.isArray(inputSchema)) return undefined;
+  return inputSchema as Record<string, unknown>;
+}
+
 export function getClaudeToolsForActiveOpenCodeTools(
   tools: unknown,
-): ReturnType<typeof getClaudeTools> {
+): ToolDefinition[] {
   if (!Array.isArray(tools)) return [];
-  const activeClaudeNames = new Set(
-    tools
-      .map((tool) => {
-        if (!tool || typeof tool !== "object") return undefined;
-        const name = (tool as { name?: unknown }).name;
-        if (typeof name !== "string") return undefined;
-        return OUTBOUND_TOOL_NAME_MAP[name] || name;
-      })
-      .filter((name): name is string => typeof name === "string"),
+  const claudeToolsByName = new Map(getClaudeTools().map((tool) => [tool.name, tool]));
+  const selectedToolsByName = new Map<string, ToolDefinition>();
+
+  for (const tool of tools) {
+    const name = getToolName(tool);
+    if (!name) continue;
+
+    const claudeName = ACTIVE_TOOL_SCHEMA_NAME_MAP[name];
+    if (claudeName) {
+      const claudeTool = claudeToolsByName.get(claudeName);
+      if (!claudeTool) continue;
+      selectedToolsByName.set(claudeName, claudeTool);
+      continue;
+    }
+
+    const inputSchema = getToolInputSchema(tool);
+    if (!inputSchema) continue;
+
+    const description = (tool as { description?: unknown }).description;
+    selectedToolsByName.set(name, {
+      name,
+      description: typeof description === "string" ? description : "",
+      input_schema: inputSchema,
+    });
+  }
+
+  return Array.from(selectedToolsByName.values()).sort((a, b) =>
+    a.name.localeCompare(b.name),
   );
-  return getClaudeTools().filter((tool) => activeClaudeNames.has(tool.name));
+}
+
+export function getInboundToolNameMapForActiveOpenCodeTools(
+  tools: unknown,
+): Record<string, string> {
+  if (!Array.isArray(tools)) return {};
+  const inboundToolNameMap: Record<string, string> = {};
+
+  for (const tool of tools) {
+    const name = getToolName(tool);
+    if (!name) continue;
+    const claudeName = ACTIVE_TOOL_SCHEMA_NAME_MAP[name];
+    if (claudeName) inboundToolNameMap[claudeName] = name;
+  }
+
+  return inboundToolNameMap;
 }
 
 const oauthProfileCache = new Map<string, Promise<OAuthProfile | null>>();
@@ -392,7 +445,7 @@ function deduplicatePrefix(text: string): string {
   return text;
 }
 
-function mapOutboundToolName(name: string | undefined): string | undefined {
+export function mapOutboundToolName(name: string | undefined): string | undefined {
   if (!name) return name;
   return OUTBOUND_TOOL_NAME_MAP[name] || name;
 }
@@ -644,6 +697,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
 
             // ── Body ──
             let body = init?.body;
+            let inboundToolNameMap = INBOUND_TOOL_NAME_MAP;
             if (body && typeof body === "string") {
               try {
                 const parsed = JSON.parse(body);
@@ -758,6 +812,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 // requests or Claude-family models on Anthropic-compatible
                 // routers such as OpenRouter.
                 if (shouldInjectClaudeTools({ model: parsed.model, requestUrl, tools: parsed.tools })) {
+                  inboundToolNameMap = getInboundToolNameMapForActiveOpenCodeTools(parsed.tools);
                   parsed.tools = getClaudeToolsForActiveOpenCodeTools(parsed.tools);
                 }
                 delete parsed.tool_choice;
@@ -869,7 +924,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             // split across TCP chunks) that regex-on-raw-bytes can't
             // handle. See src/stream.ts for the processor implementation.
             const processor = createSseProcessor({
-              inboundToolNameMap: INBOUND_TOOL_NAME_MAP,
+              inboundToolNameMap,
               translateToolArgs: translateToolArgsJsonString,
             });
 
