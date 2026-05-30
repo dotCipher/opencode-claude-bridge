@@ -16,6 +16,11 @@ interface KeychainCredentials {
   };
 }
 
+interface GetClaudeTokensOptions {
+  refreshExpired?: boolean;
+  logRefreshFailures?: boolean;
+}
+
 /**
  * Read Claude CLI credentials from macOS Keychain.
  * Falls back to ~/.claude/.credentials.json on other platforms.
@@ -49,7 +54,9 @@ export function readClaudeCredentials(): KeychainCredentials | null {
  * Get valid OAuth tokens from Claude CLI.
  * If expired, attempts to refresh via curl.
  */
-export function getClaudeTokens(): OAuthTokens | null {
+export function getClaudeTokens(options: GetClaudeTokensOptions = {}): OAuthTokens | null {
+  const refreshExpired = options.refreshExpired ?? true;
+  const logRefreshFailures = options.logRefreshFailures ?? true;
   const creds = readClaudeCredentials();
   if (!creds?.claudeAiOauth) return null;
 
@@ -64,13 +71,18 @@ export function getClaudeTokens(): OAuthTokens | null {
     };
   }
 
-  // Expired — try refresh
+  // Expired — try refresh only when the caller explicitly wants side effects.
+  // Login/bootstrap paths use this in read-only mode so stale Claude CLI
+  // keychain refresh tokens do not produce invalid_grant noise before a fresh
+  // OAuth login starts.
+  if (!refreshExpired) return null;
+
   if (refreshToken) {
     try {
       console.error("[opencode-oauth] Claude CLI token expired, refreshing...");
       return refreshTokens(refreshToken);
     } catch (err) {
-      console.error(`[opencode-oauth] Keychain refresh failed: ${err}`);
+      if (logRefreshFailures) console.error(`[opencode-oauth] Keychain refresh failed: ${err}`);
     }
   }
 
