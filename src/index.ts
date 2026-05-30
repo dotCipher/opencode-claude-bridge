@@ -278,7 +278,7 @@ async function storeAuth(
   });
 }
 
-/** Layered token refresh: keychain → stored refresh → CLI refresh token. */
+/** Layered token refresh: valid keychain access → stored refresh → CLI refresh token. */
 async function refreshAuth(
   auth: AuthType,
   client: PluginClient,
@@ -286,10 +286,19 @@ async function refreshAuth(
   type Tokens = { access: string; refresh: string; expires: number };
   let fresh: Tokens | null = null;
   const errors: string[] = [];
+  const attemptedRefreshTokens = new Set<string>();
 
-  // Layer 1: Claude CLI keychain
+  const tryRefresh = (refreshToken: string | undefined): Tokens | null => {
+    if (!refreshToken || attemptedRefreshTokens.has(refreshToken)) return null;
+    attemptedRefreshTokens.add(refreshToken);
+    return refreshTokens(refreshToken);
+  };
+
+  // Layer 1: Claude CLI keychain, but only if the access token is already
+  // valid. Expired keychain refresh tokens are often stale after re-login, so
+  // do not try them before OpenCode's own stored OAuth refresh token.
   try {
-    const kt = getClaudeTokens();
+    const kt = getClaudeTokens({ refreshExpired: false });
     if (kt && kt.expires > Date.now() + 60_000) fresh = kt;
   } catch (err) {
     errors.push(String(err));
@@ -297,16 +306,16 @@ async function refreshAuth(
 
   // Layer 2: Stored refresh token
   if (!fresh && auth.refresh) {
-    try { fresh = refreshTokens(auth.refresh); }
+    try { fresh = tryRefresh(auth.refresh); }
     catch (err) { errors.push(String(err)); }
   }
 
-  // Layer 3: CLI refresh token
+  // Layer 3: CLI refresh token, only if it differs from tokens already tried.
   if (!fresh) {
     try {
       const creds = readClaudeCredentials();
       if (creds?.claudeAiOauth?.refreshToken)
-        fresh = refreshTokens(creds.claudeAiOauth.refreshToken);
+        fresh = tryRefresh(creds.claudeAiOauth.refreshToken);
     } catch (err) {
       errors.push(String(err));
     }
@@ -538,7 +547,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
   // OpenCode builds its provider state. This ensures the loader runs on
   // startup so models appear immediately without requiring a restart.
   try {
-    const tokens = getClaudeTokens();
+    const tokens = getClaudeTokens({ refreshExpired: false });
     if (tokens) await storeAuth(client, tokens);
   } catch {}
 
@@ -576,7 +585,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
         // Auto-bootstrap from Claude CLI keychain if no OAuth tokens stored
         if (auth.type !== "oauth") {
           try {
-            const tokens = getClaudeTokens();
+            const tokens = getClaudeTokens({ refreshExpired: false });
             if (tokens) {
               await storeAuth(client, tokens);
               auth = { type: "oauth", ...tokens };
@@ -912,7 +921,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
           type: "oauth" as const,
           authorize: async () => {
             // First try: auto-bootstrap from Claude CLI keychain
-            const tokens = getClaudeTokens();
+            const tokens = getClaudeTokens({ refreshExpired: false });
             if (tokens) {
               await storeAuth(client, tokens);
               return {
