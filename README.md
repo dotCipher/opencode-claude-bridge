@@ -68,13 +68,13 @@ Every outbound OAuth request is rewritten to match what Claude Code sends on the
 
 ### Tool wire-matching (v1.9.0)
 
-Claude Code sends 24 core tools (plus user-specific MCP tools). OpenCode has 10. These differ in names, descriptions, schemas, parameter names, required fields, and sort order.
+Claude Code sends 26 captured core tools (plus user-specific MCP tools). OpenCode has 10. These differ in names, descriptions, schemas, parameter names, required fields, and sort order.
 
 The bridge resolves this by:
 
 1. **Replacing OpenCode's tool definitions only for Claude-compatible targets** with Claude Code's exact wire-captured definitions — matching descriptions, JSON schemas, parameter names, and required fields.
-2. **Adding 14 Claude-only stub tools**: `AskUserQuestion`, `CronCreate`, `CronDelete`, `CronList`, `EnterPlanMode`, `EnterWorktree`, `ExitPlanMode`, `ExitWorktree`, `Monitor`, `NotebookEdit`, `RemoteTrigger`, `TaskOutput`, `TaskStop`, `WebSearch`.
-3. **Sorting all 24 tools alphabetically** to match Claude Code's ordering.
+2. **Adding 16 Claude-only stub tools**: `AskUserQuestion`, `CronCreate`, `CronDelete`, `CronList`, `EnterPlanMode`, `EnterWorktree`, `ExitPlanMode`, `ExitWorktree`, `Monitor`, `NotebookEdit`, `PushNotification`, `RemoteTrigger`, `ScheduleWakeup`, `TaskOutput`, `TaskStop`, `WebSearch`.
+3. **Sorting all 26 tools alphabetically** to match Claude Code's ordering.
 
 If the model calls a stub tool, OpenCode's built-in error handling catches it, tells the model the tool is unavailable, and the model adapts on the next turn.
 
@@ -163,7 +163,7 @@ All OAuth and header parameters can be overridden via environment variables:
 | `ANTHROPIC_CLI_VERSION` | Auto-detected from `claude --version` or `2.1.98` | Claude CLI version string |
 | `ANTHROPIC_CLI_BUILD_ID` | `835` | Build ID for headers |
 | `ANTHROPIC_ENTRYPOINT` | `sdk-cli` | Entrypoint value for billing |
-| `ANTHROPIC_SDK_VERSION` | `0.81.0` | Stainless SDK version |
+| `ANTHROPIC_SDK_VERSION` | `0.94.0` | Stainless SDK version |
 | `ANTHROPIC_BETA_FLAGS` | Current Claude Code beta flags | Comma-separated beta feature flags |
 | `ANTHROPIC_BILLING_CCH` | (computed) | Client attestation hash override |
 | `ANTHROPIC_SYSTEM_PROMPT_PATH` | `~/.cache/opencode-claude-bridge/claude-system-prompt.json` | Path to cached system prompt |
