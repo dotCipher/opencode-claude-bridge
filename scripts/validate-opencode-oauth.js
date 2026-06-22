@@ -113,6 +113,16 @@ function redactHeaders(headers) {
   return copy;
 }
 
+function splitHeaderList(value) {
+  if (typeof value !== "string") return [];
+  return value.split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+function sortedDifference(left, right) {
+  const rightSet = new Set(right);
+  return left.filter((item) => !rightSet.has(item)).sort();
+}
+
 async function startCaptureProxy(label, outDir) {
   let requestCount = 0;
   const captures = [];
@@ -332,8 +342,21 @@ function compareRequests(reference, candidate) {
       equal: sha256(reference.body) === sha256(candidate.body),
     },
     headerDiff,
+    betaFlags: {
+      claude: splitHeaderList(reference.headers?.["anthropic-beta"]),
+      opencode: splitHeaderList(candidate.headers?.["anthropic-beta"]),
+    },
     bodyShape: null,
   };
+
+  summary.betaFlags.missingFromOpenCode = sortedDifference(
+    summary.betaFlags.claude,
+    summary.betaFlags.opencode,
+  );
+  summary.betaFlags.extraInOpenCode = sortedDifference(
+    summary.betaFlags.opencode,
+    summary.betaFlags.claude,
+  );
 
   if (parsedReference && parsedCandidate) {
     const refTools = Array.isArray(parsedReference.tools) ? parsedReference.tools.map((tool) => tool.name) : [];
@@ -376,6 +399,12 @@ function compareRequests(reference, candidate) {
         opencode: candTools.length,
       },
       toolNamesEqual: JSON.stringify(refTools) === JSON.stringify(candTools),
+      toolNames: {
+        claude: refTools,
+        opencode: candTools,
+        missingFromOpenCode: sortedDifference(refTools, candTools),
+        extraInOpenCode: sortedDifference(candTools, refTools),
+      },
     };
   }
 
@@ -497,10 +526,14 @@ async function main() {
   if (report.comparison?.available) {
     console.log(`Body hash equal: ${report.comparison.bodyHash.equal}`);
     console.log(`Header differences: ${Object.keys(report.comparison.headerDiff).length}`);
+    console.log(`Missing beta flags: ${report.comparison.betaFlags.missingFromOpenCode.length}`);
+    console.log(`Extra beta flags: ${report.comparison.betaFlags.extraInOpenCode.length}`);
     if (report.comparison.bodyShape) {
       console.log(`Tool names equal: ${report.comparison.bodyShape.toolNamesEqual}`);
       console.log(`Claude tool count: ${report.comparison.bodyShape.toolCount.claude}`);
       console.log(`OpenCode tool count: ${report.comparison.bodyShape.toolCount.opencode}`);
+      console.log(`Missing tools: ${report.comparison.bodyShape.toolNames.missingFromOpenCode.length}`);
+      console.log(`Extra tools: ${report.comparison.bodyShape.toolNames.extraInOpenCode.length}`);
     }
   }
 }

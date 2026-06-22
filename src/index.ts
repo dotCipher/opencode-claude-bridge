@@ -640,6 +640,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             headers.set("authorization", `Bearer ${accessToken}`);
             headers.delete("x-api-key");
             headers.delete("x-session-affinity");
+            headers.delete("x-session-id");
             if (!headers.has("accept")) headers.set("accept", "application/json");
             headers.set("user-agent", USER_AGENT);
             headers.set("x-app", "cli");

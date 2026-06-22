@@ -2,7 +2,7 @@
  * Claude Code tool definitions — exact wire-captured schemas.
  *
  * This module provides:
- *   1. The exact tool definitions Claude Code sends to the API (24 core tools)
+ *   1. The exact tool definitions Claude Code sends to the API (26 core tools)
  *   2. Bidirectional parameter-name translation maps (snake_case ↔ camelCase)
  *   3. A helper to build the full sorted tool array matching Claude Code's wire format
  *
@@ -669,7 +669,7 @@ const SHARED_TOOLS: ToolDefinition[] = [
 ];
 
 /**
- * The 14 Claude-only tools that OpenCode doesn't have.
+ * The 16 Claude-only tools that OpenCode doesn't have.
  * These are sent as stubs — the model may try to call them, but they'll
  * never actually execute (handled by returning a graceful error).
  */
@@ -852,6 +852,20 @@ const STUB_TOOLS: ToolDefinition[] = [
     },
   },
   {
+    name: "PushNotification",
+    description: "This tool sends a desktop notification in the user's terminal. If Remote Control is connected, it also pushes to their phone. Either way, it pulls their attention from whatever they're doing — a meeting, another task, dinner — to this session. That's the cost. The benefit is they learn something now that they'd want to know now: a long task finished while they were away, a build is ready, you've hit something that needs their decision before you can continue.\n\nBecause a notification they didn't need is annoying in a way that accumulates, err toward not sending one. Don't notify for routine progress, or to announce you've answered something they asked seconds ago and are clearly still watching, or when a quick task completes. Notify when there's a real chance they've walked away and there's something worth coming back for — or when they've explicitly asked you to notify them.\n\nKeep the message under 200 characters, one line, no markdown. Lead with what they'd act on — \"build failed: 2 auth tests\" tells them more than \"task done\" and more than a status dump.\n\nIf the result says the push wasn't sent, that's expected — no action needed.",
+    input_schema: {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      type: "object",
+      properties: {
+        message: { description: "The notification body. Keep it under 200 characters; mobile OSes truncate.", type: "string", minLength: 1 },
+        status: { type: "string", const: "proactive" },
+      },
+      required: ["message", "status"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "RemoteTrigger",
     description: "Call the claude.ai remote-trigger API. Use this instead of curl \u2014 the OAuth token is added automatically in-process and never exposed.",
     input_schema: {
@@ -863,6 +877,21 @@ const STUB_TOOLS: ToolDefinition[] = [
         body: { description: "JSON body for create and update", type: "object", propertyNames: { type: "string" }, additionalProperties: {} },
       },
       required: ["action"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "ScheduleWakeup",
+    description: "Schedule when to resume work in /loop dynamic mode — the user invoked /loop without an interval, asking you to self-pace iterations of a specific task.\n\nPass the same /loop prompt back via `prompt` each turn so the next firing repeats the task. For an autonomous /loop (no user prompt), pass the literal sentinel `<<autonomous-loop-dynamic>>` as `prompt` instead — the runtime resolves it back to the autonomous-loop instructions at fire time. (There is a similar `<<autonomous-loop>>` sentinel for CronCreate-based autonomous loops; do not confuse the two — ScheduleWakeup always uses the `-dynamic` variant.) Omit the call to end the loop.\n\n## Picking delaySeconds\n\nThe Anthropic prompt cache has a 5-minute TTL. Sleeping past 300 seconds means the next wake-up reads your full conversation context uncached — slower and more expensive. So the natural breakpoints:\n\n- **Under 5 minutes (60s–270s)**: cache stays warm. Right for active work — checking a build, polling for state that's about to change, watching a process you just started.\n- **5 minutes to 1 hour (300s–3600s)**: pay the cache miss. Right when there's no point checking sooner — waiting on something that takes minutes to change, or genuinely idle.\n\n**Don't pick 300s.** It's the worst-of-both: you pay the cache miss without amortizing it. If you're tempted to \"wait 5 minutes,\" either drop to 270s (stay in cache) or commit to 1200s+ (one cache miss buys a much longer wait). Don't think in round-number minutes — think in cache windows.\n\nFor idle ticks with no specific signal to watch, default to **1200s–1800s** (20–30 min). The loop checks back, you don't burn cache 12× per hour for nothing, and the user can always interrupt if they need you sooner.\n\nThink about what you're actually waiting for, not just \"how long should I sleep.\" If you kicked off an 8-minute build, sleeping 60s burns the cache 8 times before it finishes — sleep ~270s twice instead.\n\nThe runtime clamps to [60, 3600], so you don't need to clamp yourself.\n\n## The reason field\n\nOne short sentence on what you chose and why. Goes to telemetry and is shown back to the user. \"checking long bun build\" beats \"waiting.\" The user reads this to understand what you're doing without having to predict your cadence in advance — make it specific.\n",
+    input_schema: {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      type: "object",
+      properties: {
+        delaySeconds: { description: "Seconds from now to wake up. Clamped to [60, 3600] by the runtime.", type: "number" },
+        reason: { description: "One short sentence explaining the chosen delay. Goes to telemetry and is shown to the user. Be specific.", type: "string" },
+        prompt: { description: "The /loop input to fire on wake-up. Pass the same /loop input verbatim each turn so the next firing re-enters the skill and continues the loop. For autonomous /loop (no user prompt), pass the literal sentinel `<<autonomous-loop-dynamic>>` instead (the dynamic-pacing variant, not the CronCreate-mode `<<autonomous-loop>>`).", type: "string" },
+      },
+      required: ["delaySeconds", "reason", "prompt"],
       additionalProperties: false,
     },
   },
@@ -913,7 +942,7 @@ const STUB_TOOLS: ToolDefinition[] = [
 
 // ── Public API ──────────────────────────────────────────────────────
 
-/** All 24 Claude Code core tools, sorted alphabetically by name. */
+/** All 26 Claude Code core tools, sorted alphabetically by name. */
 export function getClaudeTools(): ToolDefinition[] {
   return [...SHARED_TOOLS, ...STUB_TOOLS].sort((a, b) =>
     a.name.localeCompare(b.name),
