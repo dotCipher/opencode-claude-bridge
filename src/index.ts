@@ -176,6 +176,13 @@ const CLAUDE_PREFIX =
  * naming changes are surfaced truthfully instead of silently wrong.
  */
 export function deriveModelDisplayName(modelId: string): string {
+  if (typeof modelId !== "string") {
+    try {
+      modelId = String(modelId);
+    } catch {
+      return "Claude";
+    }
+  }
   const m = modelId.match(/^claude-([a-z]+)-(\d+)-(\d+)(?:-\d+)?$/i);
   if (!m) return modelId;
   const [, family, major, minor] = m;
@@ -560,6 +567,117 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
     const tokens = getClaudeTokens({ refreshExpired: false });
     if (tokens) await storeAuth(client, tokens);
   } catch {}
+
+  // ── Global fetch override ───────────────────────────────────────────
+  // AI SDK requests bypass the auth method's fetch wrapper entirely. To
+  // ensure tool schema translation (camelCase ↔ snake_case) also works
+  // for API-key and other non-OAuth auth modes, wrap globalThis.fetch at
+  // plugin init time. We only intercept POSTs to the Anthropic Messages
+  // endpoint; everything else passes through unchanged.
+  {
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async (input: string | URL | Request, init?: RequestInit) => {
+      let url: URL | null = null;
+      try {
+        url = new URL(
+          typeof input === "string" ? input
+            : input instanceof URL ? input.toString()
+            : input.url,
+        );
+      } catch {}
+      if (!url || !url.pathname || (url.pathname !== "/messages" && url.pathname !== "/v1/messages")) {
+        return origFetch(input, init);
+      }
+
+      // ── Body: inject Claude Code tool schemas (snake_case) ──
+      let body = init?.body;
+      if (body && typeof body === "string") {
+        try {
+          const parsed = JSON.parse(body);
+          const requestUrl = url.toString();
+          if (shouldInjectClaudeTools({ model: parsed.model, requestUrl, tools: parsed.tools })) {
+            parsed.tools = getClaudeToolsForActiveOpenCodeTools(parsed.tools);
+          }
+          delete parsed.tool_choice;
+          if (parsed.messages && Array.isArray(parsed.messages)) {
+            for (const msg of parsed.messages) {
+              if (!Array.isArray(msg.content)) continue;
+              for (const block of msg.content) {
+                if (block.type === "tool_use" && block.name) {
+                  block.name = mapOutboundToolName(block.name);
+                  if (block.input && typeof block.input === "object") {
+                    block.input = translateArgsOpencodeToClaude(
+                      block.name,
+                      block.input as Record<string, unknown>,
+                    );
+                  }
+                }
+              }
+            }
+          }
+          body = JSON.stringify(parsed);
+        } catch {}
+      }
+
+      // ── Forward request with translated body ──
+      // Keep the original URL path untouched — the AI SDK already sends
+      // the correct /v1/messages endpoint. We only modify the body and
+      // translate the response stream.
+      let response: Response;
+      try {
+        response = await origFetch(url.toString(), Object.assign({}, init, { body }));
+      } catch (e) {
+        console.error("[opencode-claude-bridge] fetch error:", e);
+        return origFetch(input, init);
+      }
+
+      // ── Map Claude-style tool names/args back to OpenCode ──
+      // The model returns tool_use with snake_case args (file_path).
+      // OpenCode expects camelCase (filePath). The SSE processor
+      // translates on content_block_stop after buffering all deltas.
+      if (!response.body) return response;
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      const encoder = new TextEncoder();
+      const processor = createSseProcessor({
+        inboundToolNameMap: INBOUND_TOOL_NAME_MAP,
+        translateToolArgs: translateToolArgsJsonString,
+      });
+
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            (async () => {
+              try {
+                while (true) {
+                  const { done, value } = await reader.read();
+                  if (done) {
+                    const tail = processor.flush();
+                    if (tail) controller.enqueue(encoder.encode(tail));
+                    controller.close();
+                    return;
+                  }
+                  const out = processor.feedChunk(decoder.decode(value, { stream: true }));
+                  if (out) controller.enqueue(encoder.encode(out));
+                }
+              } catch (e) {
+                // AbortError is normal — the AI SDK cancels the stream
+                // when the user interrupts or a tool call finishes. Close
+                // gracefully instead of propagating the error to OpenCode.
+                if (e instanceof DOMException && e.name === "AbortError") {
+                  try { controller.close(); } catch {}
+                  return;
+                }
+                console.error("[opencode-claude-bridge] stream error:", e);
+                try { controller.error(e); } catch {}
+              }
+            })();
+          },
+        }),
+        { status: response.status, statusText: response.statusText, headers: response.headers },
+      );
+    };
+  }
 
   return {
     "experimental.chat.system.transform": (
