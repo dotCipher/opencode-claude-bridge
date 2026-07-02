@@ -18,12 +18,15 @@ import {
   shouldUseClaudeToolSchemas,
 } from "./claude-tools.js";
 import { extractOAuthErrorDetail } from "./oauth.js";
-import { getClaudeToolsForActiveOpenCodeTools, shouldInjectClaudeTools, stripAssistantPrefillForClaude } from "./index.js";
-import { createSseProcessor, parseSseEvent, buildSseEvent } from "./stream.js";
 import {
   deriveModelDisplayName,
+  getClaudeToolsForActiveOpenCodeTools,
   rewriteSystemBlocksForModel,
+  shouldInjectClaudeTools,
+  stripAssistantPrefillForClaude,
+  stripSystemCacheControl,
 } from "./index.js";
+import { createSseProcessor, parseSseEvent, buildSseEvent } from "./stream.js";
 
 // ── Helpers (extracted / reimplemented from index.ts for unit testing) ────────
 
@@ -170,6 +173,18 @@ describe("Claude assistant prefill stripping", () => {
       { role: "assistant", content: "Real assistant content" },
     ];
     assert.deepEqual(stripAssistantPrefillForClaude(input), input);
+  });
+});
+
+describe("system cache control", () => {
+  it("strips cache_control from system blocks", () => {
+    assert.deepEqual(stripSystemCacheControl([
+      { type: "text", text: "a", cache_control: { type: "ephemeral" } },
+      { type: "text", text: "b" },
+    ]), [
+      { type: "text", text: "a" },
+      { type: "text", text: "b" },
+    ]);
   });
 });
 

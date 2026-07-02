@@ -209,6 +209,16 @@ export function rewriteSystemBlocksForModel(
   });
 }
 
+export function stripSystemCacheControl(
+  system: Array<{ type?: string; text?: string; cache_control?: unknown }>,
+): Array<{ type?: string; text?: string }> {
+  return system.map((block) => {
+    if (!("cache_control" in block)) return block;
+    const { cache_control, ...rest } = block;
+    return rest;
+  });
+}
+
 export function shouldInjectClaudeTools(input: {
   model?: string;
   requestUrl?: string;
@@ -762,6 +772,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                   // Otherwise keep the existing prompt but shape it closer to Claude Code.
                   parsed.system = normalizeSystemBlocks(parsed.system);
                 }
+                parsed.system = stripSystemCacheControl(parsed.system);
 
                 // Keep OpenCode's default tool schemas for non-Claude targets.
                 // Claude wire schemas are only useful for Anthropic-native
