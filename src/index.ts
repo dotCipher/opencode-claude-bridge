@@ -758,7 +758,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                   billingHeader = parsed.system[0]?.text || billingHeader;
                 }
 
-                // If we have a locally captured Claude Code system prompt, prefer it.
+                // Merge Claude Code system prompt with opencode's existing system (including AGENTS.md).
                 if (cachedClaudeSystem) {
                   const rewritten = rewriteSystemBlocksForModel(
                     cachedClaudeSystem,
@@ -766,6 +766,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                   );
                   parsed.system = [
                     { type: "text", text: billingHeader },
+                    ...parsed.system,
                     ...rewritten,
                   ];
                 } else if (parsed.system && Array.isArray(parsed.system)) {
