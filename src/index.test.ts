@@ -157,6 +157,10 @@ describe("OAuth error parsing", () => {
 });
 
 describe("Claude assistant prefill stripping", () => {
+  const maxStepsPrefill = `CRITICAL - MAXIMUM STEPS REACHED
+
+The maximum number of steps allowed for this task has been reached. Tools are disabled until next user input. Respond with text only.`;
+
   it("strips the synthetic continue prefill so Anthropic requests end with a user message", () => {
     const out = stripAssistantPrefillForClaude([
       { role: "user", content: [{ type: "text", text: "hello" }] },
@@ -167,10 +171,41 @@ describe("Claude assistant prefill stripping", () => {
     ]);
   });
 
+  it("converts opencode max-steps assistant prefill into a user message", () => {
+    const out = stripAssistantPrefillForClaude([
+      { role: "user", content: [{ type: "text", text: "hello" }] },
+      { role: "assistant", content: maxStepsPrefill },
+    ]);
+    assert.deepEqual(out, [
+      { role: "user", content: [{ type: "text", text: "hello" }] },
+      { role: "user", content: maxStepsPrefill },
+    ]);
+  });
+
+  it("converts text-block max-steps assistant prefill into a user message", () => {
+    const content = [{ type: "text", text: maxStepsPrefill }];
+    const out = stripAssistantPrefillForClaude([
+      { role: "user", content: [{ type: "text", text: "hello" }] },
+      { role: "assistant", content },
+    ]);
+    assert.deepEqual(out, [
+      { role: "user", content: [{ type: "text", text: "hello" }] },
+      { role: "user", content },
+    ]);
+  });
+
   it("keeps non-synthetic assistant messages intact", () => {
     const input = [
       { role: "user", content: [{ type: "text", text: "hello" }] },
       { role: "assistant", content: "Real assistant content" },
+    ];
+    assert.deepEqual(stripAssistantPrefillForClaude(input), input);
+  });
+
+  it("keeps assistant tool-use messages intact", () => {
+    const input = [
+      { role: "user", content: [{ type: "text", text: "hello" }] },
+      { role: "assistant", content: [{ type: "tool_use", id: "toolu_1", name: "Read", input: {} }] },
     ];
     assert.deepEqual(stripAssistantPrefillForClaude(input), input);
   });
