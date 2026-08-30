@@ -25,7 +25,7 @@ import {
   shouldInjectClaudeTools,
   stripAssistantPrefillForClaude,
   stripSystemCacheControl,
-} from "./index.js";
+} from "./transform.js";
 import { createSseProcessor, parseSseEvent, buildSseEvent } from "./stream.js";
 
 // ── Helpers (extracted / reimplemented from index.ts for unit testing) ────────
@@ -1126,5 +1126,24 @@ describe("rewriteSystemBlocksForModel", () => {
     const out = rewriteSystemBlocksForModel(blocks, "claude-opus-4-7");
     assert.deepEqual(out[0], nonText);
     assert.equal(out[1].text, "no identity line here");
+  });
+});
+
+describe("plugin entry export surface", () => {
+  it("index.ts exports only the default plugin", async () => {
+    // opencode's plugin loader enumerates EVERY named export of the file listed
+    // in `opencode.json`'s `plugin` array, requires each to be a function, calls
+    // each as `await fn(input, options)`, and pushes the return value into a
+    // shared hook list that it iterates with no null guard. So a named export
+    // here is loader surface, not API, and it can take a session down two ways:
+    // by throwing when called (the whole plugin is skipped with "failed to load
+    // plugin"), or by returning null (every later plugin.trigger dies, and the
+    // user sees only "Unexpected server error. Check server logs for details.").
+    //
+    // Shared helpers therefore live in transform.ts, which the loader never
+    // scans. Keep this at exactly one export.
+    const mod = await import("./index.js");
+    assert.deepEqual(Object.keys(mod), ["default"]);
+    assert.equal(typeof mod.default, "function");
   });
 });
