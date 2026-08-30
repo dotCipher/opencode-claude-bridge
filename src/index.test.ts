@@ -18,6 +18,7 @@ import {
   shouldUseClaudeToolSchemas,
 } from "./claude-tools.js";
 import { extractOAuthErrorDetail } from "./oauth.js";
+import { selectClaudeCredentials } from "./keychain.js";
 import {
   deriveModelDisplayName,
   getClaudeToolsForActiveOpenCodeTools,
@@ -1126,5 +1127,34 @@ describe("rewriteSystemBlocksForModel", () => {
     const out = rewriteSystemBlocksForModel(blocks, "claude-opus-4-7");
     assert.deepEqual(out[0], nonText);
     assert.equal(out[1].text, "no identity line here");
+  });
+});
+
+describe("selectClaudeCredentials", () => {
+  const real = {
+    claudeAiOauth: {
+      accessToken: "a",
+      refreshToken: "r",
+      expiresAt: 1,
+    },
+  };
+  // What attaching an MCP server writes under the same service name.
+  const mcpOnly = { mcpOAuth: { some: "thing" } } as never;
+
+  it("skips an item that has no claudeAiOauth", () => {
+    assert.equal(selectClaudeCredentials([mcpOnly, real]), real);
+  });
+
+  it("prefers the first item that does carry claudeAiOauth", () => {
+    const other = { claudeAiOauth: { accessToken: "b", refreshToken: "r", expiresAt: 2 } };
+    assert.equal(selectClaudeCredentials([real, other]), real);
+  });
+
+  it("returns null when nothing carries claudeAiOauth", () => {
+    assert.equal(selectClaudeCredentials([null, mcpOnly]), null);
+  });
+
+  it("tolerates a null candidate from a failed lookup", () => {
+    assert.equal(selectClaudeCredentials([null, real]), real);
   });
 });
