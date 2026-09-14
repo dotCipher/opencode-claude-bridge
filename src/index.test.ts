@@ -19,6 +19,7 @@ import {
 } from "./claude-tools.js";
 import { extractOAuthErrorDetail } from "./oauth.js";
 import {
+  default as pluginModule,
   deriveModelDisplayName,
   getClaudeToolsForActiveOpenCodeTools,
   getInboundToolNameMapForActiveOpenCodeTools,
@@ -1221,5 +1222,19 @@ describe("rewriteSystemBlocksForModel", () => {
     const out = rewriteSystemBlocksForModel(blocks, "claude-opus-4-7");
     assert.deepEqual(out[0], nonText);
     assert.equal(out[1].text, "no identity line here");
+  });
+});
+
+describe("plugin module shape", () => {
+  it("default-exports { id, server } so opencode's loader recognises it", () => {
+    // A bare function default export sends opencode down its legacy path, where
+    // it calls every named export of this module as a plugin factory — which
+    // crashes on the helpers above and takes the whole plugin down with it.
+    assert.equal(typeof pluginModule, "object");
+    assert.equal(typeof pluginModule.server, "function");
+  });
+
+  it("carries an id, which opencode requires for path-referenced plugins", () => {
+    assert.equal(pluginModule.id, "opencode-claude-bridge");
   });
 });

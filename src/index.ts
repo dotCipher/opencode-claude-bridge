@@ -24,6 +24,7 @@ import {
   DEFAULT_EFFORT,
   CLEAR_THINKING_TYPE,
   SESSION_ID,
+  PLUGIN_ID,
 } from "./constants.js";
 import {
   getClaudeTools,
@@ -1134,4 +1135,15 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
   };
 };
 
-export default OpenCodeClaudeBridge;
+/**
+ * opencode plugin module.
+ *
+ * The `{ id, server }` shape is what opencode's plugin loader looks for. A bare
+ * function default export makes it fall back to its legacy path, which treats
+ * every named export of this module as a plugin factory and invokes it with
+ * `(input, options)` — crashing on the helpers exported here for tests.
+ */
+export default {
+  id: PLUGIN_ID,
+  server: OpenCodeClaudeBridge,
+};
