@@ -1,6 +1,33 @@
-# opencode-claude-bridge
+# opencode-claude-bridge (mortonbaker fork)
 
 Use your Claude Pro/Max subscription in [OpenCode](https://opencode.ai). If you're logged into the Claude CLI, it just works — no extra setup.
+
+## Fork delta — slim pantheon support
+
+This fork patches `claude-tools.ts` so Claude (as orchestrator) can spawn
+[`oh-my-opencode-slim`](https://github.com/alvinunreal/oh-my-opencode-slim)
+subagents (e.g. `@explorer`, `@fixer`, `@oracle` — typically bound to
+MiniMax M2.7-highspeed for cost efficiency).
+
+**Why it was needed:** upstream's Agent-tool description hardcodes the four
+Claude Code SDK built-ins (`general-purpose`/`statusline-setup`/`Explore`/`Plan`).
+Claude self-restricts to those because that's all the description tells it
+exists. The slim plugin's `task` tool registers more roles, but the bridge
+never told Claude about them.
+
+**What the patch does:** at module load, the bridge reads
+`~/.config/opencode/oh-my-opencode-slim.json`, finds the active preset, and
+injects each non-orchestrator role into the Agent-tool description with its
+model binding. Inbound tool-arg translation already passes unknown
+`subagent_type` values through unchanged, so no other change is needed.
+
+**Fallback:** if the slim config is absent or malformed, the description
+falls back to the original (four built-ins only). Upstream behavior preserved.
+
+Source of the change: `src/claude-tools.ts` — `readSlimSubagentRoles()` and
+`buildAgentDescription()`.
+
+---
 
 ## Install
 
