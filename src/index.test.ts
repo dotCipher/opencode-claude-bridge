@@ -21,6 +21,7 @@ import { extractOAuthErrorDetail } from "./oauth.js";
 import { selectClaudeCredentials } from "./keychain.js";
 import {
   default as pluginModule,
+  buildBetaFlags,
   deriveModelDisplayName,
   getClaudeToolsForActiveOpenCodeTools,
   getInboundToolNameMapForActiveOpenCodeTools,
@@ -31,6 +32,36 @@ import {
   stripSystemCacheControl,
 } from "./index.js";
 import { createSseProcessor, parseSseEvent, buildSseEvent } from "./stream.js";
+import { BETA_FLAGS, OAUTH_BETA_FLAG } from "./constants.js";
+
+describe("Anthropic beta headers", () => {
+  it("preserves SDK beta flags alongside the bridge requirements", () => {
+    const sdkBeta = "thinking-binding-controls-test";
+    const flags = buildBetaFlags(sdkBeta).split(",");
+    assert.ok(flags.includes(sdkBeta), "request-body feature betas must survive rewriting");
+    assert.deepEqual(flags.slice(0, 2), ["claude-code-20250219", OAUTH_BETA_FLAG]);
+    for (const flag of BETA_FLAGS.split(",").map((value) => value.trim()).filter(Boolean)) {
+      assert.ok(flags.includes(flag), `missing configured beta: ${flag}`);
+    }
+  });
+
+  it("deduplicates overlapping flags and removes whitespace and empty entries", () => {
+    const flags = buildBetaFlags(
+      ` , ${OAUTH_BETA_FLAG}, claude-code-20250219, ${BETA_FLAGS}, sdk-test, sdk-test, , `,
+    ).split(",");
+    assert.equal(flags.length, new Set(flags).size);
+    assert.ok(flags.every((flag) => flag.length > 0 && flag === flag.trim()));
+    assert.ok(flags.includes("sdk-test"));
+  });
+
+  it("keeps the bridge requirements when no incoming beta header is present", () => {
+    assert.deepEqual(buildBetaFlags("").split(","), [...new Set([
+      "claude-code-20250219",
+      OAUTH_BETA_FLAG,
+      ...BETA_FLAGS.split(",").map((flag) => flag.trim()).filter(Boolean),
+    ])]);
+  });
+});
 
 // ── Helpers (extracted / reimplemented from index.ts for unit testing) ────────
 

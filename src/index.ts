@@ -453,12 +453,15 @@ function mergeHeaders(target: Headers, source: HeadersInit) {
 }
 
 /** Build deduplicated beta flags string. */
-function buildBetaFlags(existing: string): string {
-  const required = BETA_FLAGS.split(",").map((b) => b.trim()).filter(Boolean);
-  const withoutSpecials = required.filter(
-    (beta) => beta !== "claude-code-20250219" && beta !== OAUTH_BETA_FLAG,
-  );
-  return ["claude-code-20250219", OAUTH_BETA_FLAG, ...withoutSpecials].join(",");
+export function buildBetaFlags(existing: string): string {
+  // Preserve SDK betas that enable fields already present in the request body.
+  const flags = [
+    "claude-code-20250219",
+    OAUTH_BETA_FLAG,
+    ...BETA_FLAGS.split(","),
+    ...existing.split(","),
+  ];
+  return [...new Set(flags.map((flag) => flag.trim()).filter(Boolean))].join(",");
 }
 
 /** Deduplicate repeated Claude Code prefix in a text block. */
