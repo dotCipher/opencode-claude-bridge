@@ -9,6 +9,9 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   translateToolArgsJsonString,
@@ -42,6 +45,12 @@ import {
 } from "./index.js";
 import { createSseProcessor, parseSseEvent, buildSseEvent } from "./stream.js";
 import { BETA_FLAGS, OAUTH_BETA_FLAG } from "./constants.js";
+import {
+  MAX_RETRY_DELAY_MS,
+  getResponseRetryDelayMs,
+  parseRetryAfterMs,
+  waitForRetry,
+} from "./retry.js";
 
 describe("Anthropic beta headers", () => {
   it("preserves SDK beta flags alongside the bridge requirements", () => {
@@ -2175,5 +2184,135 @@ describe("selectClaudeCredentials", () => {
 
   it("tolerates a null candidate from a failed lookup", () => {
     assert.equal(selectClaudeCredentials([null, real]), real);
+  });
+});
+
+describe("retry policy", () => {
+  const now = Date.parse("2026-10-04T12:00:00Z");
+
+  it("reads Retry-After as delay seconds or as an HTTP date", () => {
+    assert.equal(parseRetryAfterMs("3", now), 3000);
+    assert.equal(parseRetryAfterMs("Sun, 04 Oct 2026 12:00:05 GMT", now), 5000);
+    assert.equal(parseRetryAfterMs("Sun, 04 Oct 2026 11:59:00 GMT", now), 0);
+    assert.equal(parseRetryAfterMs(null, now), null);
+    assert.equal(parseRetryAfterMs("", now), null);
+    assert.equal(parseRetryAfterMs("-1", now), null);
+    assert.equal(parseRetryAfterMs("soon", now), null);
+  });
+
+  it("waits as long as Retry-After asks, else backs off", () => {
+    assert.equal(getResponseRetryDelayMs(new Headers({ "retry-after": "4" }), 0, now), 4000);
+    assert.equal(getResponseRetryDelayMs(new Headers(), 0, now), 2000);
+    assert.equal(getResponseRetryDelayMs(new Headers(), 1, now), 4000);
+  });
+
+  it("refuses a wait longer than the bridge absorbs", () => {
+    const seconds = String(MAX_RETRY_DELAY_MS / 1000 + 1);
+    assert.equal(getResponseRetryDelayMs(new Headers({ "retry-after": seconds }), 0, now), null);
+    assert.equal(getResponseRetryDelayMs(new Headers({ "retry-after": "18000" }), 0, now), null);
+  });
+
+  it("ends a retry wait early when the request is aborted", async () => {
+    const controller = new AbortController();
+    const reason = new Error("aborted by caller");
+    const started = Date.now();
+    const wait = waitForRetry(5000, controller.signal);
+    controller.abort(reason);
+    await assert.rejects(wait, (err) => err === reason);
+    assert.ok(Date.now() - started < 1000);
+    await assert.rejects(waitForRetry(10, controller.signal), (err) => err === reason);
+  });
+});
+
+describe("API request retry", () => {
+  type Reply = { status: number; retryAfter?: string };
+
+  // Drives the plugin's real fetch wrapper against a stubbed network. Auth is a
+  // valid stored token, so no refresh (and no real token request) can happen;
+  // 429 cases only use waits the bridge refuses, which return before refreshing.
+  // HOME and XDG_DATA_HOME point at a scratch dir so the developer's own Claude
+  // CLI credentials and opencode log dir are never touched.
+  async function sendThroughBridge(replies: Reply[], signal?: AbortSignal) {
+    const originalFetch = globalThis.fetch;
+    const originalEnv = {
+      ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
+      HOME: process.env.HOME,
+      XDG_DATA_HOME: process.env.XDG_DATA_HOME,
+    };
+    const scratchDir = mkdtempSync(join(tmpdir(), "bridge-retry-test-"));
+    process.env.HOME = scratchDir;
+    process.env.XDG_DATA_HOME = join(scratchDir, "data");
+    const messageCalls: string[] = [];
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (!url.includes("/v1/messages")) return new Response("{}", { status: 404 });
+      messageCalls.push(url);
+      const reply = replies[Math.min(messageCalls.length - 1, replies.length - 1)];
+      return new Response(JSON.stringify({ type: reply.status === 200 ? "message" : "error" }), {
+        status: reply.status,
+        headers: reply.retryAfter === undefined ? {} : { "retry-after": reply.retryAfter },
+      });
+    }) as typeof fetch;
+
+    try {
+      const hooks = await pluginModule.server({ client: { auth: { set: async () => {} } } });
+      const loaded = await hooks.auth.loader(
+        async () => ({
+          type: "oauth",
+          access: "test-access",
+          refresh: "test-refresh",
+          expires: Date.now() + 3_600_000,
+        }),
+        { models: {} },
+      ) as { fetch: (input: string, init?: RequestInit) => Promise<Response> };
+      const response = await loaded.fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        body: JSON.stringify({
+          model: "claude-haiku-4-5",
+          max_tokens: 16,
+          messages: [{ role: "user", content: "hi" }],
+        }),
+        signal,
+      });
+      return { status: response.status, calls: messageCalls.length };
+    } finally {
+      globalThis.fetch = originalFetch;
+      for (const [name, value] of Object.entries(originalEnv)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+      rmSync(scratchDir, { recursive: true, force: true });
+    }
+  }
+
+  it("retries an overloaded response and returns the recovered one", async () => {
+    const result = await sendThroughBridge([{ status: 529, retryAfter: "0" }, { status: 200 }]);
+    assert.deepEqual(result, { status: 200, calls: 2 });
+  });
+
+  it("stops after two retries and returns the last overloaded response", async () => {
+    const result = await sendThroughBridge([{ status: 529, retryAfter: "0" }]);
+    assert.deepEqual(result, { status: 529, calls: 3 });
+  });
+
+  it("returns a long Retry-After at once instead of waiting inside the request", async () => {
+    const started = Date.now();
+    const result = await sendThroughBridge([{ status: 429, retryAfter: "18000" }]);
+    assert.deepEqual(result, { status: 429, calls: 1 });
+    assert.ok(Date.now() - started < 1000);
+  });
+
+  it("does not retry other errors", async () => {
+    const result = await sendThroughBridge([{ status: 500 }]);
+    assert.deepEqual(result, { status: 500, calls: 1 });
+  });
+
+  it("gives up the retry wait when the request is aborted", async () => {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(new Error("cancelled")), 20);
+    await assert.rejects(
+      sendThroughBridge([{ status: 529, retryAfter: "5" }], controller.signal),
+      /cancelled/,
+    );
   });
 });

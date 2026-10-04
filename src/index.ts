@@ -13,6 +13,12 @@ import {
 } from "./oauth.js";
 import { getClaudeTokens, readClaudeCredentials } from "./keychain.js";
 import {
+  MAX_RESPONSE_RETRIES,
+  RETRYABLE_STATUSES,
+  getResponseRetryDelayMs,
+  waitForRetry,
+} from "./retry.js";
+import {
   BETA_FLAGS,
   CLI_VERSION,
   OAUTH_BETA_FLAG,
@@ -1102,7 +1108,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 : input.url,
             );
 
-            // ── Request (with 429 auto-refresh retry) ──
+            // ── Request (with 429/529 retry) ──
             const outHeaders: Record<string, string> = {};
             headers.forEach((v, k) => { outHeaders[k] = v; });
 
@@ -1115,11 +1121,22 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
 
             let response = await doFetch();
 
-            // 429 auto-refresh: rate limits are per-access-token, so refreshing
-            // the token gives us a fresh rate limit bucket. Try up to 2 retries.
-            if (response.status === 429) {
-              for (let retry = 0; retry < 2; retry++) {
-                console.error(`[opencode-claude-bridge] 429 rate limited (attempt ${retry + 1}/2), refreshing token...`);
+            // Retry rate-limited (429) and overloaded (529) responses, waiting
+            // as long as Retry-After asks. A longer wait than the bridge absorbs
+            // returns the response as-is so opencode's own retry takes over.
+            for (
+              let retry = 0;
+              retry < MAX_RESPONSE_RETRIES && RETRYABLE_STATUSES.has(response.status);
+              retry++
+            ) {
+              const delayMs = getResponseRetryDelayMs(response.headers, retry);
+              if (delayMs === null) break;
+              const attempt = `attempt ${retry + 1}/${MAX_RESPONSE_RETRIES}`;
+
+              if (response.status === 429) {
+                // 429 auto-refresh: rate limits are per-access-token, so
+                // refreshing the token gives us a fresh rate limit bucket.
+                console.error(`[opencode-claude-bridge] 429 rate limited (${attempt}), refreshing token...`);
                 let freshToken: string | null = null;
                 try {
                   freshToken = await refreshAuth(auth, client);
@@ -1133,11 +1150,14 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                   break;
                 }
                 outHeaders["authorization"] = `Bearer ${freshToken}`;
-                // Back off briefly: 1s first retry, 2s second
-                await new Promise((r) => setTimeout(r, 1000 * (retry + 1)));
-                response = await doFetch();
-                if (response.status !== 429) break;
+              } else {
+                console.error(`[opencode-claude-bridge] ${response.status} overloaded (${attempt}), retrying in ${Math.ceil(delayMs / 1000)}s...`);
               }
+
+              // Release the failed response's connection before reusing it.
+              await response.body?.cancel().catch(() => {});
+              await waitForRetry(delayMs, init?.signal);
+              response = await doFetch();
             }
 
             // ── Map Claude-style tool names and arguments back to OpenCode ──
