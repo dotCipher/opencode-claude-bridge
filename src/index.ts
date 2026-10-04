@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { hostname, userInfo } from "node:os";
-import { join } from "node:path";
+import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { homedir, hostname, userInfo } from "node:os";
+import { dirname, join } from "node:path";
 import {
   createAuthorizationRequest,
   exchangeCodeForTokens,
@@ -10,6 +10,12 @@ import {
   startOAuthCallbackServer,
 } from "./oauth.js";
 import { getClaudeTokens, readClaudeCredentials } from "./keychain.js";
+import {
+  MAX_RESPONSE_RETRIES,
+  RETRYABLE_STATUSES,
+  getResponseRetryDelayMs,
+  waitForRetry,
+} from "./retry.js";
 import {
   BETA_FLAGS,
   CLI_VERSION,
@@ -216,6 +222,16 @@ export function rewriteSystemBlocksForModel(
   });
 }
 
+/**
+ * The Messages API takes `system` as a plain string or as text blocks; the
+ * request rewrite (billing header, prompt shaping) works on blocks only.
+ */
+export function toSystemBlocks(system: unknown): unknown {
+  if (!system) return [];
+  if (typeof system === "string") return [{ type: "text", text: system }];
+  return system;
+}
+
 export function stripSystemCacheControl(
   system: Array<{ type?: string; text?: string; cache_control?: unknown }>,
 ): Array<{ type?: string; text?: string }> {
@@ -309,6 +325,46 @@ export function getInboundToolNameMapForActiveOpenCodeTools(
 const oauthProfileCache = new Map<string, Promise<OAuthProfile | null>>();
 const SYSTEM_PROMPT_CACHE_PATH = process.env.ANTHROPIC_SYSTEM_PROMPT_PATH
   || join(process.env.HOME || "", ".cache", "opencode-claude-bridge", "claude-system-prompt.json");
+
+/**
+ * Where failed API responses are recorded, next to opencode's own logs.
+ * opencode only surfaces a one-line summary of a failed request; the full
+ * error body and request id are what a bug report needs.
+ */
+function getApiErrorLogPath(): string {
+  const dataHome = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
+  return join(dataHome, "opencode", "log", "claude-bridge-api-errors.log");
+}
+
+/** Record a failed API response on stderr and in the error log; never throws. */
+async function logApiErrorResponse(response: Response, requestUrl: string): Promise<void> {
+  try {
+    const requestId = response.headers.get("request-id") || response.headers.get("x-request-id");
+    const responseBody = await response.clone().text();
+    const statusLine = `[opencode-claude-bridge] API error status=${response.status} url=${requestUrl}`
+      + (requestId ? ` request-id=${requestId}` : "");
+
+    console.error(statusLine);
+    if (responseBody) {
+      console.error(`[opencode-claude-bridge] API error response: ${responseBody.slice(0, 8000)}`);
+    }
+
+    try {
+      const logPath = getApiErrorLogPath();
+      mkdirSync(dirname(logPath), { recursive: true });
+      const entry = [
+        `time=${new Date().toISOString()}`,
+        statusLine,
+        responseBody ? `response: ${responseBody}` : "",
+      ].filter(Boolean).join("\n");
+      appendFileSync(logPath, `${entry}\n\n`, "utf8");
+    } catch (err) {
+      console.error(`[opencode-claude-bridge] Failed to write the API error log: ${err}`);
+    }
+  } catch (err) {
+    console.error(`[opencode-claude-bridge] Failed to read the API error response: ${err}`);
+  }
+}
 
 function buildAuthFailureResponse(detail: string): Response {
   const message = [
@@ -763,7 +819,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                   parsed.temperature = 1;
                 }
 
-                if (!parsed.system) parsed.system = [];
+                parsed.system = toSystemBlocks(parsed.system);
                 if (Array.isArray(parsed.messages)) {
                   parsed.messages = stripAssistantPrefillForClaude(parsed.messages);
                 }
@@ -899,7 +955,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             const finalUrl = requestUrl?.toString()
               ?? (input instanceof Request ? input.url : String(input));
 
-            // ── Request (with 429 auto-refresh retry) ──
+            // ── Request (with 429/529 retry) ──
             const outHeaders: Record<string, string> = {};
             headers.forEach((v, k) => { outHeaders[k] = v; });
 
@@ -912,11 +968,22 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
 
             let response = await doFetch();
 
-            // 429 auto-refresh: rate limits are per-access-token, so refreshing
-            // the token gives us a fresh rate limit bucket. Try up to 2 retries.
-            if (response.status === 429) {
-              for (let retry = 0; retry < 2; retry++) {
-                console.error(`[opencode-claude-bridge] 429 rate limited (attempt ${retry + 1}/2), refreshing token...`);
+            // Retry rate-limited (429) and overloaded (529) responses, waiting
+            // as long as Retry-After asks. A longer wait than the bridge absorbs
+            // returns the response as-is so opencode's own retry takes over.
+            for (
+              let retry = 0;
+              retry < MAX_RESPONSE_RETRIES && RETRYABLE_STATUSES.has(response.status);
+              retry++
+            ) {
+              const delayMs = getResponseRetryDelayMs(response.headers, retry);
+              if (delayMs === null) break;
+              const attempt = `attempt ${retry + 1}/${MAX_RESPONSE_RETRIES}`;
+
+              if (response.status === 429) {
+                // 429 auto-refresh: rate limits are per-access-token, so
+                // refreshing the token gives us a fresh rate limit bucket.
+                console.error(`[opencode-claude-bridge] 429 rate limited (${attempt}), refreshing token...`);
                 let freshToken: string | null = null;
                 try {
                   freshToken = await refreshAuth(auth, client);
@@ -930,12 +997,17 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                   break;
                 }
                 outHeaders["authorization"] = `Bearer ${freshToken}`;
-                // Back off briefly: 1s first retry, 2s second
-                await new Promise((r) => setTimeout(r, 1000 * (retry + 1)));
-                response = await doFetch();
-                if (response.status !== 429) break;
+              } else {
+                console.error(`[opencode-claude-bridge] ${response.status} overloaded (${attempt}), retrying in ${Math.ceil(delayMs / 1000)}s...`);
               }
+
+              // Release the failed response's connection before reusing it.
+              await response.body?.cancel().catch(() => {});
+              await waitForRetry(delayMs, init?.signal);
+              response = await doFetch();
             }
+
+            if (!response.ok) await logApiErrorResponse(response, finalUrl);
 
             // ── Map Claude-style tool names and arguments back to OpenCode ──
             if (!response.body) return response;

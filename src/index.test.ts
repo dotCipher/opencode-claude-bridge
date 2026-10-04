@@ -9,6 +9,9 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   translateToolArgsJsonString,
@@ -17,7 +20,7 @@ import {
   AGENT_TYPE_OPENCODE_TO_CLAUDE,
   shouldUseClaudeToolSchemas,
 } from "./claude-tools.js";
-import { extractOAuthErrorDetail } from "./oauth.js";
+import { extractOAuthErrorDetail, refreshTokens } from "./oauth.js";
 import { selectClaudeCredentials } from "./keychain.js";
 import {
   default as pluginModule,
@@ -29,8 +32,16 @@ import {
   shouldInjectClaudeTools,
   stripAssistantPrefillForClaude,
   stripSystemCacheControl,
+  toSystemBlocks,
 } from "./index.js";
 import { createSseProcessor, parseSseEvent, buildSseEvent } from "./stream.js";
+import {
+  MAX_RETRY_DELAY_MS,
+  getResponseRetryDelayMs,
+  getTokenRetryDelayMs,
+  parseRetryAfterMs,
+  waitForRetry,
+} from "./retry.js";
 
 // ── Helpers (extracted / reimplemented from index.ts for unit testing) ────────
 
@@ -1266,5 +1277,260 @@ describe("selectClaudeCredentials", () => {
 
   it("tolerates a null candidate from a failed lookup", () => {
     assert.equal(selectClaudeCredentials([null, real]), real);
+  });
+});
+
+describe("retry policy", () => {
+  const now = Date.parse("2026-10-04T12:00:00Z");
+
+  it("reads Retry-After as delay seconds or as an HTTP date", () => {
+    assert.equal(parseRetryAfterMs("3", now), 3000);
+    assert.equal(parseRetryAfterMs("Sun, 04 Oct 2026 12:00:05 GMT", now), 5000);
+    assert.equal(parseRetryAfterMs("Sun, 04 Oct 2026 11:59:00 GMT", now), 0);
+    assert.equal(parseRetryAfterMs(null, now), null);
+    assert.equal(parseRetryAfterMs("", now), null);
+    assert.equal(parseRetryAfterMs("-1", now), null);
+    assert.equal(parseRetryAfterMs("soon", now), null);
+  });
+
+  it("waits as long as Retry-After asks, else backs off", () => {
+    assert.equal(getResponseRetryDelayMs(new Headers({ "retry-after": "4" }), 0, now), 4000);
+    assert.equal(getResponseRetryDelayMs(new Headers(), 0, now), 2000);
+    assert.equal(getResponseRetryDelayMs(new Headers(), 1, now), 4000);
+  });
+
+  it("refuses a wait longer than the bridge absorbs", () => {
+    const seconds = String(MAX_RETRY_DELAY_MS / 1000 + 1);
+    assert.equal(getResponseRetryDelayMs(new Headers({ "retry-after": seconds }), 0, now), null);
+    assert.equal(getResponseRetryDelayMs(new Headers({ "retry-after": "18000" }), 0, now), null);
+  });
+
+  it("reads the token endpoint's retry_after from the body", () => {
+    assert.equal(getTokenRetryDelayMs(529, '{"retry_after":2}', 0), 2000);
+    assert.equal(getTokenRetryDelayMs(429, '{"error":{"retry_after":"3"}}', 0), 3000);
+    assert.equal(getTokenRetryDelayMs(529, '{"retry_after":600}', 0), null);
+  });
+
+  it("backs off the token endpoint when the body has no retry_after", () => {
+    assert.equal(getTokenRetryDelayMs(529, "not json", 0), 2000);
+    assert.equal(getTokenRetryDelayMs(529, "{}", 3), 8000);
+    assert.equal(getTokenRetryDelayMs(429, "{}", 1, 0.5), 2500);
+  });
+
+  it("ends a retry wait early when the request is aborted", async () => {
+    const controller = new AbortController();
+    const reason = new Error("aborted by caller");
+    const started = Date.now();
+    const wait = waitForRetry(5000, controller.signal);
+    controller.abort(reason);
+    await assert.rejects(wait, (err) => err === reason);
+    assert.ok(Date.now() - started < 1000);
+    await assert.rejects(waitForRetry(10, controller.signal), (err) => err === reason);
+  });
+});
+
+describe("bridge fetch wrapper", () => {
+  type Reply = { status: number; retryAfter?: string };
+
+  // Drives the plugin's real fetch wrapper against a stubbed network. Auth is a
+  // valid stored token, so no refresh (and no real token request) can happen;
+  // 429 cases only use waits the bridge refuses, which return before refreshing.
+  // HOME and XDG_DATA_HOME point at a scratch dir so the developer's own Claude
+  // CLI credentials and opencode log dir are never touched.
+  async function sendThroughBridge(
+    replies: Reply[],
+    signal?: AbortSignal,
+    requestBody: Record<string, unknown> = {
+      model: "claude-haiku-4-5",
+      max_tokens: 16,
+      messages: [{ role: "user", content: "hi" }],
+    },
+  ) {
+    const originalFetch = globalThis.fetch;
+    const originalEnv = {
+      ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
+      HOME: process.env.HOME,
+      XDG_DATA_HOME: process.env.XDG_DATA_HOME,
+    };
+    const scratchDir = mkdtempSync(join(tmpdir(), "bridge-retry-test-"));
+    process.env.HOME = scratchDir;
+    process.env.XDG_DATA_HOME = join(scratchDir, "data");
+    const messageCalls: string[] = [];
+    const sentBodies: string[] = [];
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (!url.includes("/v1/messages")) return new Response("{}", { status: 404 });
+      messageCalls.push(url);
+      sentBodies.push(String(init?.body));
+      const reply = replies[Math.min(messageCalls.length - 1, replies.length - 1)];
+      const body = reply.status === 200
+        ? { type: "message" }
+        : { type: "error", error: { type: "api_error", message: `failure ${reply.status}` } };
+      const headers: Record<string, string> = { "request-id": `req_${messageCalls.length}` };
+      if (reply.retryAfter !== undefined) headers["retry-after"] = reply.retryAfter;
+      return new Response(JSON.stringify(body), { status: reply.status, headers });
+    }) as typeof fetch;
+
+    try {
+      const hooks = await pluginModule.server({ client: { auth: { set: async () => {} } } });
+      const loaded = await hooks.auth.loader(
+        async () => ({
+          type: "oauth",
+          access: "test-access",
+          refresh: "test-refresh",
+          expires: Date.now() + 3_600_000,
+        }),
+        { models: {} },
+      ) as { fetch: (input: string, init?: RequestInit) => Promise<Response> };
+      const response = await loaded.fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        body: JSON.stringify(requestBody),
+        signal,
+      });
+      const errorLogPath = join(scratchDir, "data", "opencode", "log", "claude-bridge-api-errors.log");
+      const errorLog = existsSync(errorLogPath) ? readFileSync(errorLogPath, "utf8") : "";
+      return { status: response.status, calls: messageCalls.length, sentBodies, errorLog };
+    } finally {
+      globalThis.fetch = originalFetch;
+      for (const [name, value] of Object.entries(originalEnv)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+      rmSync(scratchDir, { recursive: true, force: true });
+    }
+  }
+
+  it("retries an overloaded response and returns the recovered one", async () => {
+    const { status, calls } = await sendThroughBridge([{ status: 529, retryAfter: "0" }, { status: 200 }]);
+    assert.deepEqual({ status, calls }, { status: 200, calls: 2 });
+  });
+
+  it("stops after two retries and returns the last overloaded response", async () => {
+    const { status, calls } = await sendThroughBridge([{ status: 529, retryAfter: "0" }]);
+    assert.deepEqual({ status, calls }, { status: 529, calls: 3 });
+  });
+
+  it("returns a long Retry-After at once instead of waiting inside the request", async () => {
+    const started = Date.now();
+    const { status, calls } = await sendThroughBridge([{ status: 429, retryAfter: "18000" }]);
+    assert.deepEqual({ status, calls }, { status: 429, calls: 1 });
+    assert.ok(Date.now() - started < 1000);
+  });
+
+  it("does not retry other errors", async () => {
+    const { status, calls } = await sendThroughBridge([{ status: 500 }]);
+    assert.deepEqual({ status, calls }, { status: 500, calls: 1 });
+  });
+
+  it("records the final failed response in the API error log", async () => {
+    const { status, errorLog } = await sendThroughBridge([{ status: 529, retryAfter: "0" }, { status: 500 }]);
+    assert.equal(status, 500);
+    // Only the response returned to opencode is logged, not the retried ones.
+    assert.match(errorLog, /status=500 url=https:\/\/api\.anthropic\.com\/v1\/messages\S* request-id=req_2/);
+    assert.match(errorLog, /response: .*failure 500/);
+    assert.doesNotMatch(errorLog, /status=529/);
+  });
+
+  it("logs nothing for a successful response", async () => {
+    const { errorLog } = await sendThroughBridge([{ status: 200 }]);
+    assert.equal(errorLog, "");
+  });
+
+  it("rewrites a request whose system prompt is a plain string", async () => {
+    const { status, sentBodies } = await sendThroughBridge([{ status: 200 }], undefined, {
+      model: "claude-haiku-4-5",
+      max_tokens: 16,
+      system: "Be brief.",
+      messages: [{ role: "user", content: "hi" }],
+    });
+    assert.equal(status, 200);
+    const system = JSON.parse(sentBodies[0]).system;
+    assert.ok(Array.isArray(system), "system must be sent as blocks");
+    assert.match(system[0].text, /^x-anthropic-billing-header:/);
+  });
+
+  it("gives up the retry wait when the request is aborted", async () => {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(new Error("cancelled")), 20);
+    await assert.rejects(
+      sendThroughBridge([{ status: 529, retryAfter: "5" }], controller.signal),
+      /cancelled/,
+    );
+  });
+});
+
+describe("token endpoint retry", () => {
+  type Reply = { status: number; body: string };
+
+  // Runs refreshTokens against a stand-in `curl` placed first on PATH, so the
+  // real retry loop executes without a network. POSIX-only (shebang script).
+  function refreshWithReplies(replies: Reply[]): { result: unknown; calls: number } {
+    const dir = mkdtempSync(join(tmpdir(), "bridge-token-test-"));
+    const originalPath = process.env.PATH;
+    writeFileSync(join(dir, "replies.json"), JSON.stringify(replies));
+    writeFileSync(join(dir, "curl"), `#!${process.execPath}
+const fs = require("node:fs");
+const dir = ${JSON.stringify(dir)};
+const countFile = dir + "/count";
+const count = fs.existsSync(countFile) ? Number(fs.readFileSync(countFile, "utf8")) : 0;
+fs.writeFileSync(countFile, String(count + 1));
+const replies = JSON.parse(fs.readFileSync(dir + "/replies.json", "utf8"));
+const reply = replies[Math.min(count, replies.length - 1)];
+process.stdout.write(reply.body + "\\n__HTTP_STATUS__" + reply.status);
+`);
+    chmodSync(join(dir, "curl"), 0o755);
+    process.env.PATH = `${dir}:${originalPath}`;
+    try {
+      let result: unknown;
+      try {
+        result = refreshTokens("test-refresh-token");
+      } catch (err) {
+        result = err instanceof Error ? err.message : err;
+      }
+      return { result, calls: Number(readFileSync(join(dir, "count"), "utf8")) };
+    } finally {
+      process.env.PATH = originalPath;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  const ok = {
+    status: 200,
+    body: JSON.stringify({ access_token: "new-access", refresh_token: "new-refresh", expires_in: 3600 }),
+  };
+  const overloaded = (retryAfter: number) => ({
+    status: 529,
+    body: JSON.stringify({ error: { type: "overloaded_error", message: "Overloaded" }, retry_after: retryAfter }),
+  });
+
+  it("retries an overloaded token endpoint", { skip: process.platform === "win32" }, () => {
+    const { result, calls } = refreshWithReplies([overloaded(0), ok]);
+    assert.equal(calls, 2);
+    assert.equal((result as { access: string }).access, "new-access");
+  });
+
+  it("reports the endpoint's real last answer once retries run out", { skip: process.platform === "win32" }, () => {
+    const { result, calls } = refreshWithReplies([overloaded(0)]);
+    assert.equal(calls, 3);
+    assert.match(String(result), /failed \(529\): Overloaded/);
+  });
+
+  it("does not sit through a long requested wait", { skip: process.platform === "win32" }, () => {
+    const { result, calls } = refreshWithReplies([overloaded(600), ok]);
+    assert.equal(calls, 1);
+    assert.match(String(result), /failed \(529\)/);
+  });
+});
+
+describe("plain-string system prompt", () => {
+  it("wraps a string in a single text block", () => {
+    assert.deepEqual(toSystemBlocks("Be brief."), [{ type: "text", text: "Be brief." }]);
+  });
+
+  it("passes blocks through and turns an absent prompt into no blocks", () => {
+    const blocks = [{ type: "text", text: "x" }];
+    assert.equal(toSystemBlocks(blocks), blocks);
+    assert.deepEqual(toSystemBlocks(undefined), []);
+    assert.deepEqual(toSystemBlocks(""), []);
   });
 });

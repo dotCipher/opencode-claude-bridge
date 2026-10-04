@@ -145,6 +145,12 @@ SHA256(salt + message[4] + message[7] + message[20] + CLI_VERSION).slice(0, 3)
 
 The salt is hardcoded in Claude Code's source. This changes per conversation because the user's message text changes.
 
+### Retries and error log
+
+Rate-limited (429) and overloaded (529) responses are retried up to twice, waiting as long as `Retry-After` asks. A requested wait longer than 10 seconds is not absorbed inside the request: the response goes straight back to OpenCode, whose own retry loop shows the wait and can be cancelled. The OAuth token endpoint is retried the same way.
+
+Every failed response handed back to OpenCode is written to stderr and appended, with its request id, to `~/.local/share/opencode/log/claude-bridge-api-errors.log` (under `$XDG_DATA_HOME` when set).
+
 ## Requirements
 
 - [OpenCode](https://opencode.ai) v1.2+
@@ -228,6 +234,7 @@ src/
   constants.ts      — Version strings, URLs, env overrides, header values (117 lines)
   keychain.ts       — macOS Keychain access for OAuth tokens
   oauth.ts          — OAuth PKCE flow with local callback server
+  retry.ts          — Retry policy for API responses and the token endpoint
 
 scripts/
   validate-opencode-oauth.js  — Side-by-side wire comparison tool

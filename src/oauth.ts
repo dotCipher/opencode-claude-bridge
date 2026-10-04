@@ -9,6 +9,7 @@ import {
   SCOPES,
   USER_AGENT,
 } from "./constants.js";
+import { RETRYABLE_STATUSES, getTokenRetryDelayMs } from "./retry.js";
 
 export interface OAuthTokens {
   access: string;
@@ -69,6 +70,7 @@ function curlPost(
   const payload = JSON.stringify(body);
 
   for (let attempt = 0; attempt < retries; attempt++) {
+    let retryDelayMs: number;
     try {
       const result = execFileSync(
         "curl",
@@ -84,23 +86,27 @@ function curlPost(
       const status = parseInt(parts[parts.length - 1], 10);
       const responseBody = parts.slice(0, -1).join("\n__HTTP_STATUS__");
 
-      if (status !== 429 || attempt === retries - 1) {
+      if (!RETRYABLE_STATUSES.has(status) || attempt === retries - 1) {
         return { status, body: responseBody };
       }
+      // Null when the endpoint asks for a longer wait than this blocking call
+      // should sit through: hand its real answer back instead.
+      const delayMs = getTokenRetryDelayMs(status, responseBody, attempt);
+      if (delayMs === null) return { status, body: responseBody };
+      retryDelayMs = delayMs;
 
       console.error(
-        `[opencode-oauth] Token endpoint 429 (attempt ${attempt + 1}/${retries}), retrying...`,
+        `[opencode-oauth] Token endpoint ${status} (attempt ${attempt + 1}/${retries}), retrying...`,
       );
     } catch (err) {
       if (attempt === retries - 1) throw err;
+      retryDelayMs = 1000 * Math.pow(2, attempt) + Math.random() * 1000;
     }
-    sleep(1000 * Math.pow(2, attempt) + Math.random() * 1000);
+    sleep(retryDelayMs);
   }
 
-  return {
-    status: 429,
-    body: '{"error":{"type":"rate_limit_error","message":"Rate limited"}}',
-  };
+  // Unreachable: the last attempt always returns or throws.
+  throw new Error("Token endpoint request was not attempted");
 }
 
 export function extractOAuthErrorDetail(body: string): string {
