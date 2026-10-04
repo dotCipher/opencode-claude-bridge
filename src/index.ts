@@ -524,15 +524,44 @@ function maybeUnquoteText(text: string): string {
   return text;
 }
 
+/** opencode's synthetic continuation nudge — a content-free assistant turn, safe to drop. */
+const OPENCODE_CONTINUATION_NUDGE = "Continue with your tasks.";
+/**
+ * Appended after any remaining assistant tail so the request ends on a user turn.
+ * The Claude subscription endpoint rejects assistant-message prefill
+ * ("does not support assistant message prefill. The conversation must end with a user message").
+ */
+const ASSISTANT_TAIL_USER_CONTINUATION = "Continue.";
+
+// The Claude subscription endpoint (unlike the raw Anthropic API) does NOT support
+// assistant-message prefill: the messages array must end with a user turn. Drop
+// opencode's content-free continuation nudge, then guarantee a user tail for ANY
+// other assistant-tailed request (e.g. a resumed session whose last saved turn was
+// the assistant's) by appending a minimal user turn — preserving the assistant
+// content instead of discarding it. Previously only the exact nudge string was
+// handled, so every other assistant tail hit a 400.
 export function stripAssistantPrefillForClaude(
   messages: Array<{ role?: string; content?: unknown }>,
 ): Array<{ role?: string; content?: unknown }> {
   if (messages.length === 0) return messages;
-  const last = messages[messages.length - 1];
-  if (last?.role !== "assistant") return messages;
-  if (typeof last.content !== "string") return messages;
-  if (last.content.trim() !== "Continue with your tasks.") return messages;
-  return messages.slice(0, -1);
+  let result = messages;
+  const last = result[result.length - 1];
+  if (
+    last?.role === "assistant" &&
+    typeof last.content === "string" &&
+    last.content.trim() === OPENCODE_CONTINUATION_NUDGE
+  ) {
+    result = result.slice(0, -1);
+  }
+  const tail = result[result.length - 1];
+  if (tail?.role === "assistant") {
+    // Assumes the assistant tail is a final/text turn. A dangling tool_use tail
+    // (a turn interrupted between the tool call and its result) would make this
+    // appended user turn violate Anthropic's tool_use/tool_result pairing — but
+    // that corrupted-resume shape already fails the endpoint's prefill rule too.
+    result = [...result, { role: "user", content: ASSISTANT_TAIL_USER_CONTINUATION }];
+  }
+  return result;
 }
 
 function normalizeSystemBlocks(

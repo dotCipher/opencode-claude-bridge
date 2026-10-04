@@ -210,12 +210,59 @@ describe("Claude assistant prefill stripping", () => {
     ]);
   });
 
-  it("keeps non-synthetic assistant messages intact", () => {
-    const input = [
+  it("appends a user turn after a real assistant tail so the request ends on a user message", () => {
+    const out = stripAssistantPrefillForClaude([
       { role: "user", content: [{ type: "text", text: "hello" }] },
       { role: "assistant", content: "Real assistant content" },
+    ]);
+    assert.deepEqual(out, [
+      { role: "user", content: [{ type: "text", text: "hello" }] },
+      { role: "assistant", content: "Real assistant content" },
+      { role: "user", content: "Continue." },
+    ]);
+  });
+
+  it("drops the nudge then appends a user turn when it trails a real assistant turn", () => {
+    const out = stripAssistantPrefillForClaude([
+      { role: "user", content: [{ type: "text", text: "hello" }] },
+      { role: "assistant", content: "Real assistant content" },
+      { role: "assistant", content: "Continue with your tasks." },
+    ]);
+    assert.deepEqual(out, [
+      { role: "user", content: [{ type: "text", text: "hello" }] },
+      { role: "assistant", content: "Real assistant content" },
+      { role: "user", content: "Continue." },
+    ]);
+  });
+
+  it("ends on a user turn after opencode's max-steps assistant prefill", () => {
+    const maxSteps = "CRITICAL - MAXIMUM STEPS REACHED\n\nTools are disabled until next user input. Respond with text only.";
+    for (const content of [maxSteps, [{ type: "text", text: maxSteps }]]) {
+      const out = stripAssistantPrefillForClaude([
+        { role: "user", content: [{ type: "text", text: "hello" }] },
+        { role: "assistant", content },
+      ]);
+      assert.deepEqual(out, [
+        { role: "user", content: [{ type: "text", text: "hello" }] },
+        { role: "assistant", content },
+        { role: "user", content: "Continue." },
+      ]);
+    }
+  });
+
+  it("leaves a user-tailed conversation unchanged", () => {
+    const input = [
+      { role: "assistant", content: "earlier answer" },
+      { role: "user", content: [{ type: "text", text: "hello" }] },
     ];
-    assert.deepEqual(stripAssistantPrefillForClaude(input), input);
+    const out = stripAssistantPrefillForClaude(input);
+    // Assert against a fresh literal (not the same reference) so the test would
+    // fail if the function mutated the input or appended a synthetic turn.
+    assert.deepEqual(out, [
+      { role: "assistant", content: "earlier answer" },
+      { role: "user", content: [{ type: "text", text: "hello" }] },
+    ]);
+    assert.equal(out.length, 2);
   });
 });
 
