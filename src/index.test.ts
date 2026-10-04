@@ -36,6 +36,7 @@ import {
   rewriteSystemBlocksForModel,
   shouldInjectClaudeTools,
   stripAssistantPrefillForClaude,
+  stripMessageCacheControlPreservingTail,
   stripSystemCacheControl,
   type V2PluginContext,
 } from "./index.js";
@@ -275,6 +276,59 @@ describe("system cache control", () => {
       { type: "text", text: "a" },
       { type: "text", text: "b" },
     ]);
+  });
+});
+
+describe("message cache control (tail breakpoint)", () => {
+  it("preserves the tail message's text cache_control but strips earlier ones", () => {
+    const messages = [
+      {
+        role: "user",
+        content: [{ type: "text", text: "old", cache_control: { type: "ephemeral" } }],
+      },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "mid", cache_control: { type: "ephemeral" } }],
+      },
+      {
+        role: "user",
+        content: [{ type: "text", text: "tail", cache_control: { type: "ephemeral" } }],
+      },
+    ];
+    stripMessageCacheControlPreservingTail(messages);
+    // Earlier messages: cache_control stripped.
+    assert.equal("cache_control" in messages[0].content[0], false);
+    assert.equal("cache_control" in messages[1].content[0], false);
+    // Tail message: cache_control preserved (the surviving breakpoint).
+    assert.deepEqual(messages[2].content[0].cache_control, { type: "ephemeral" });
+  });
+
+  it("preserves a tail breakpoint even when the tail block is text (text-tailed request)", () => {
+    const messages = [
+      { role: "user", content: [{ type: "text", text: "q", cache_control: { type: "ephemeral" } }] },
+    ];
+    stripMessageCacheControlPreservingTail(messages);
+    assert.deepEqual(messages[0].content[0].cache_control, { type: "ephemeral" });
+  });
+
+  it("leaves non-text blocks and messages without content untouched", () => {
+    const messages: Array<{ role: string; content?: unknown }> = [
+      {
+        role: "user",
+        content: [
+          { type: "tool_result", tool_use_id: "t1", content: "r", cache_control: { type: "ephemeral" } },
+          { type: "text", text: "x", cache_control: { type: "ephemeral" } },
+        ],
+      },
+      { role: "assistant", content: undefined },
+      { role: "user", content: [{ type: "text", text: "tail" }] },
+    ];
+    stripMessageCacheControlPreservingTail(messages);
+    const first = messages[0].content as Array<Record<string, unknown>>;
+    // Non-text block: never stripped.
+    assert.deepEqual(first[0].cache_control, { type: "ephemeral" });
+    // Earlier text block: stripped.
+    assert.equal("cache_control" in first[1], false);
   });
 });
 

@@ -228,6 +228,37 @@ export function stripSystemCacheControl(
   });
 }
 
+/**
+ * Strip OpenCode's cache_control from message TEXT blocks, but PRESERVE the
+ * breakpoint on the tail (last) message.
+ *
+ * OpenCode's automatic cache policy marks the tail message's final content part
+ * with cache_control (the prompt-prefix cache breakpoint). We must strip the
+ * client-set cache_control on the Claude Code subscription endpoint — EXCEPT the
+ * single tail breakpoint. Without it, a text-tailed request (e.g. a plain user
+ * turn, or a compaction/summary request whose last message is text) has no
+ * surviving breakpoint and Anthropic never reads the warm prefix (cache_read 0);
+ * only tool-block-tailed requests cached, because non-text blocks are never
+ * stripped here. Keeping the one tail breakpoint restores caching for every
+ * request shape without ADDING breakpoints (stays within Anthropic's 4-breakpoint
+ * cap — OpenCode already placed and capped it). Mutates in place.
+ */
+export function stripMessageCacheControlPreservingTail(
+  messages: Array<{ content?: unknown }>,
+): void {
+  const tailIndex = messages.length - 1;
+  for (let index = 0; index < messages.length; index++) {
+    if (index === tailIndex) continue; // preserve the tail message's breakpoint
+    const content = messages[index]?.content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (block && block.type === "text" && "cache_control" in block) {
+        delete block.cache_control;
+      }
+    }
+  }
+}
+
 export function shouldInjectClaudeTools(input: {
   model?: string;
   requestUrl?: string;
@@ -826,12 +857,15 @@ async function transformClaudeRequestBody(
   // - Translate tool_use input arguments (camelCase → snake_case)
   // - Clean up text blocks
   if (parsed.messages && Array.isArray(parsed.messages)) {
+    // Preserve the tail cache_control breakpoint so text-tailed
+    // requests still cache on the subscription route (earlier text
+    // blocks are still stripped). See the helper for the rationale.
+    stripMessageCacheControlPreservingTail(parsed.messages);
     for (const msg of parsed.messages) {
       if (!Array.isArray(msg.content)) continue;
       for (const block of msg.content) {
         if (block.type === "text" && typeof block.text === "string") {
           block.text = maybeUnquoteText(block.text);
-          delete block.cache_control;
         }
         if (block.type === "tool_use" && block.name) {
           block.name = mapOutboundToolName(block.name);
