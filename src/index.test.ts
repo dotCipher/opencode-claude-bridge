@@ -42,6 +42,7 @@ import {
   stripAssistantPrefillForClaude,
   stripMessageCacheControlPreservingTail,
   stripSystemCacheControl,
+  toSystemBlocks,
   type V2PluginContext,
 } from "./index.js";
 import { createSseProcessor, parseSseEvent, buildSseEvent } from "./stream.js";
@@ -2238,7 +2239,7 @@ describe("retry policy", () => {
   });
 });
 
-describe("API request retry", () => {
+describe("bridge fetch wrapper", () => {
   type Reply = { status: number; retryAfter?: string };
 
   // Drives the plugin's real fetch wrapper against a stubbed network. Auth is a
@@ -2246,7 +2247,15 @@ describe("API request retry", () => {
   // 429 cases only use waits the bridge refuses, which return before refreshing.
   // HOME and XDG_DATA_HOME point at a scratch dir so the developer's own Claude
   // CLI credentials and opencode log dir are never touched.
-  async function sendThroughBridge(replies: Reply[], signal?: AbortSignal) {
+  async function sendThroughBridge(
+    replies: Reply[],
+    signal?: AbortSignal,
+    requestBody: Record<string, unknown> = {
+      model: "claude-haiku-4-5",
+      max_tokens: 16,
+      messages: [{ role: "user", content: "hi" }],
+    },
+  ) {
     const originalFetch = globalThis.fetch;
     const originalEnv = {
       ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
@@ -2257,10 +2266,12 @@ describe("API request retry", () => {
     process.env.HOME = scratchDir;
     process.env.XDG_DATA_HOME = join(scratchDir, "data");
     const messageCalls: string[] = [];
-    globalThis.fetch = (async (input: string | URL | Request) => {
+    const sentBodies: string[] = [];
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
       const url = input instanceof Request ? input.url : String(input);
       if (!url.includes("/v1/messages")) return new Response("{}", { status: 404 });
       messageCalls.push(url);
+      sentBodies.push(String(init?.body));
       const reply = replies[Math.min(messageCalls.length - 1, replies.length - 1)];
       return new Response(JSON.stringify({ type: reply.status === 200 ? "message" : "error" }), {
         status: reply.status,
@@ -2281,14 +2292,10 @@ describe("API request retry", () => {
       ) as { fetch: (input: string, init?: RequestInit) => Promise<Response> };
       const response = await loaded.fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
-        body: JSON.stringify({
-          model: "claude-haiku-4-5",
-          max_tokens: 16,
-          messages: [{ role: "user", content: "hi" }],
-        }),
+        body: JSON.stringify(requestBody),
         signal,
       });
-      return { status: response.status, calls: messageCalls.length };
+      return { status: response.status, calls: messageCalls.length, sentBodies };
     } finally {
       globalThis.fetch = originalFetch;
       for (const [name, value] of Object.entries(originalEnv)) {
@@ -2300,25 +2307,38 @@ describe("API request retry", () => {
   }
 
   it("retries an overloaded response and returns the recovered one", async () => {
-    const result = await sendThroughBridge([{ status: 529, retryAfter: "0" }, { status: 200 }]);
-    assert.deepEqual(result, { status: 200, calls: 2 });
+    const { status, calls } = await sendThroughBridge([{ status: 529, retryAfter: "0" }, { status: 200 }]);
+    assert.deepEqual({ status, calls }, { status: 200, calls: 2 });
   });
 
   it("stops after two retries and returns the last overloaded response", async () => {
-    const result = await sendThroughBridge([{ status: 529, retryAfter: "0" }]);
-    assert.deepEqual(result, { status: 529, calls: 3 });
+    const { status, calls } = await sendThroughBridge([{ status: 529, retryAfter: "0" }]);
+    assert.deepEqual({ status, calls }, { status: 529, calls: 3 });
   });
 
   it("returns a long Retry-After at once instead of waiting inside the request", async () => {
     const started = Date.now();
-    const result = await sendThroughBridge([{ status: 429, retryAfter: "18000" }]);
-    assert.deepEqual(result, { status: 429, calls: 1 });
+    const { status, calls } = await sendThroughBridge([{ status: 429, retryAfter: "18000" }]);
+    assert.deepEqual({ status, calls }, { status: 429, calls: 1 });
     assert.ok(Date.now() - started < 1000);
   });
 
   it("does not retry other errors", async () => {
-    const result = await sendThroughBridge([{ status: 500 }]);
-    assert.deepEqual(result, { status: 500, calls: 1 });
+    const { status, calls } = await sendThroughBridge([{ status: 500 }]);
+    assert.deepEqual({ status, calls }, { status: 500, calls: 1 });
+  });
+
+  it("rewrites a request whose system prompt is a plain string", async () => {
+    const { status, sentBodies } = await sendThroughBridge([{ status: 200 }], undefined, {
+      model: "claude-haiku-4-5",
+      max_tokens: 16,
+      system: "Be brief.",
+      messages: [{ role: "user", content: "hi" }],
+    });
+    assert.equal(status, 200);
+    const system = JSON.parse(sentBodies[0]).system;
+    assert.ok(Array.isArray(system), "system must be sent as blocks");
+    assert.match(system[0].text, /^x-anthropic-billing-header:/);
   });
 
   it("gives up the retry wait when the request is aborted", async () => {
@@ -2391,5 +2411,18 @@ process.stdout.write(reply.body + "\\n__HTTP_STATUS__" + reply.status);
     const { result, calls } = refreshWithReplies([overloaded(600), ok]);
     assert.equal(calls, 1);
     assert.match(String(result), /failed \(529\)/);
+  });
+});
+
+describe("plain-string system prompt", () => {
+  it("wraps a string in a single text block", () => {
+    assert.deepEqual(toSystemBlocks("Be brief."), [{ type: "text", text: "Be brief." }]);
+  });
+
+  it("passes blocks through and turns an absent prompt into no blocks", () => {
+    const blocks = [{ type: "text", text: "x" }];
+    assert.equal(toSystemBlocks(blocks), blocks);
+    assert.deepEqual(toSystemBlocks(undefined), []);
+    assert.deepEqual(toSystemBlocks(""), []);
   });
 });

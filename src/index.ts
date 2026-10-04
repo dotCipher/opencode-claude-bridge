@@ -224,6 +224,16 @@ export function rewriteSystemBlocksForModel(
   });
 }
 
+/**
+ * The Messages API takes `system` as a plain string or as text blocks; the
+ * request rewrite (billing header, prompt shaping) works on blocks only.
+ */
+export function toSystemBlocks(system: unknown): unknown {
+  if (!system) return [];
+  if (typeof system === "string") return [{ type: "text", text: system }];
+  return system;
+}
+
 export function stripSystemCacheControl(
   system: Array<{ type?: string; text?: string; cache_control?: unknown }>,
 ): Array<{ type?: string; text?: string }> {
@@ -777,7 +787,7 @@ async function transformClaudeRequestBody(
     parsed.temperature = 1;
   }
 
-  if (!parsed.system) parsed.system = [];
+  parsed.system = toSystemBlocks(parsed.system);
   if (Array.isArray(parsed.messages)) {
     parsed.messages = stripAssistantPrefillForClaude(parsed.messages);
   }
