@@ -1,6 +1,7 @@
 /**
- * Retry policy for the Messages API wrapper. Pure apart from the timer in
- * waitForRetry, so it can be tested without a network.
+ * Retry policy shared by the Messages API wrapper and the OAuth token
+ * endpoint. Pure apart from the timer in waitForRetry, so it can be tested
+ * without a network.
  */
 
 /** Statuses the bridge retries itself: rate limited, and overloaded. */
@@ -42,6 +43,35 @@ export function getResponseRetryDelayMs(
 ): number | null {
   const delayMs = parseRetryAfterMs(headers.get("retry-after"), now)
     ?? getOverloadedBackoffMs(attempt);
+  return delayMs > MAX_RETRY_DELAY_MS ? null : delayMs;
+}
+
+/**
+ * Delay before retry `attempt` (0-based) of the token endpoint, which reports
+ * its requested wait as `retry_after` seconds in the JSON body. Null when that
+ * wait is longer than the bridge should absorb — the token request is a
+ * blocking call, so a long sleep would stall opencode entirely.
+ */
+export function getTokenRetryDelayMs(
+  status: number,
+  body: string,
+  attempt: number,
+  random = Math.random(),
+): number | null {
+  let requestedMs: number | null = null;
+  try {
+    const parsed = JSON.parse(body) as {
+      retry_after?: number | string;
+      error?: { retry_after?: number | string };
+    };
+    const seconds = Number(parsed.retry_after ?? parsed.error?.retry_after);
+    if (Number.isFinite(seconds) && seconds >= 0) requestedMs = seconds * 1000;
+  } catch {}
+
+  const delayMs = requestedMs
+    ?? (status === 529
+      ? getOverloadedBackoffMs(attempt)
+      : 1000 * 2 ** attempt + random * 1000);
   return delayMs > MAX_RETRY_DELAY_MS ? null : delayMs;
 }
 
