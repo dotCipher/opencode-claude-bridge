@@ -9,7 +9,7 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -23,6 +23,7 @@ import {
 import {
   extractOAuthErrorDetail,
   parseOAuthRedirect,
+  refreshTokens,
   startOAuthCallbackServer,
   type OAuthTokens,
 } from "./oauth.js";
@@ -48,6 +49,7 @@ import { BETA_FLAGS, OAUTH_BETA_FLAG } from "./constants.js";
 import {
   MAX_RETRY_DELAY_MS,
   getResponseRetryDelayMs,
+  getTokenRetryDelayMs,
   parseRetryAfterMs,
   waitForRetry,
 } from "./retry.js";
@@ -2212,6 +2214,18 @@ describe("retry policy", () => {
     assert.equal(getResponseRetryDelayMs(new Headers({ "retry-after": "18000" }), 0, now), null);
   });
 
+  it("reads the token endpoint's retry_after from the body", () => {
+    assert.equal(getTokenRetryDelayMs(529, '{"retry_after":2}', 0), 2000);
+    assert.equal(getTokenRetryDelayMs(429, '{"error":{"retry_after":"3"}}', 0), 3000);
+    assert.equal(getTokenRetryDelayMs(529, '{"retry_after":600}', 0), null);
+  });
+
+  it("backs off the token endpoint when the body has no retry_after", () => {
+    assert.equal(getTokenRetryDelayMs(529, "not json", 0), 2000);
+    assert.equal(getTokenRetryDelayMs(529, "{}", 3), 8000);
+    assert.equal(getTokenRetryDelayMs(429, "{}", 1, 0.5), 2500);
+  });
+
   it("ends a retry wait early when the request is aborted", async () => {
     const controller = new AbortController();
     const reason = new Error("aborted by caller");
@@ -2314,5 +2328,68 @@ describe("API request retry", () => {
       sendThroughBridge([{ status: 529, retryAfter: "5" }], controller.signal),
       /cancelled/,
     );
+  });
+});
+
+describe("token endpoint retry", () => {
+  type Reply = { status: number; body: string };
+
+  // Runs refreshTokens against a stand-in `curl` placed first on PATH, so the
+  // real retry loop executes without a network. POSIX-only (shebang script).
+  function refreshWithReplies(replies: Reply[]): { result: unknown; calls: number } {
+    const dir = mkdtempSync(join(tmpdir(), "bridge-token-test-"));
+    const originalPath = process.env.PATH;
+    writeFileSync(join(dir, "replies.json"), JSON.stringify(replies));
+    writeFileSync(join(dir, "curl"), `#!${process.execPath}
+const fs = require("node:fs");
+const dir = ${JSON.stringify(dir)};
+const countFile = dir + "/count";
+const count = fs.existsSync(countFile) ? Number(fs.readFileSync(countFile, "utf8")) : 0;
+fs.writeFileSync(countFile, String(count + 1));
+const replies = JSON.parse(fs.readFileSync(dir + "/replies.json", "utf8"));
+const reply = replies[Math.min(count, replies.length - 1)];
+process.stdout.write(reply.body + "\\n__HTTP_STATUS__" + reply.status);
+`);
+    chmodSync(join(dir, "curl"), 0o755);
+    process.env.PATH = `${dir}:${originalPath}`;
+    try {
+      let result: unknown;
+      try {
+        result = refreshTokens("test-refresh-token");
+      } catch (err) {
+        result = err instanceof Error ? err.message : err;
+      }
+      return { result, calls: Number(readFileSync(join(dir, "count"), "utf8")) };
+    } finally {
+      process.env.PATH = originalPath;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  const ok = {
+    status: 200,
+    body: JSON.stringify({ access_token: "new-access", refresh_token: "new-refresh", expires_in: 3600 }),
+  };
+  const overloaded = (retryAfter: number) => ({
+    status: 529,
+    body: JSON.stringify({ error: { type: "overloaded_error", message: "Overloaded" }, retry_after: retryAfter }),
+  });
+
+  it("retries an overloaded token endpoint", { skip: process.platform === "win32" }, () => {
+    const { result, calls } = refreshWithReplies([overloaded(0), ok]);
+    assert.equal(calls, 2);
+    assert.equal((result as { access: string }).access, "new-access");
+  });
+
+  it("reports the endpoint's real last answer once retries run out", { skip: process.platform === "win32" }, () => {
+    const { result, calls } = refreshWithReplies([overloaded(0)]);
+    assert.equal(calls, 3);
+    assert.match(String(result), /failed \(529\): Overloaded/);
+  });
+
+  it("does not sit through a long requested wait", { skip: process.platform === "win32" }, () => {
+    const { result, calls } = refreshWithReplies([overloaded(600), ok]);
+    assert.equal(calls, 1);
+    assert.match(String(result), /failed \(529\)/);
   });
 });
