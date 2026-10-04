@@ -29,6 +29,7 @@ import {
   shouldInjectClaudeTools,
   stripAssistantPrefillForClaude,
   stripSystemCacheControl,
+  stripMessageCacheControlPreservingTail,
 } from "./index.js";
 import { createSseProcessor, parseSseEvent, buildSseEvent } from "./stream.js";
 
@@ -171,12 +172,59 @@ describe("Claude assistant prefill stripping", () => {
     ]);
   });
 
-  it("keeps non-synthetic assistant messages intact", () => {
-    const input = [
+  it("appends a user turn after a real assistant tail so the request ends on a user message", () => {
+    const out = stripAssistantPrefillForClaude([
       { role: "user", content: [{ type: "text", text: "hello" }] },
       { role: "assistant", content: "Real assistant content" },
+    ]);
+    assert.deepEqual(out, [
+      { role: "user", content: [{ type: "text", text: "hello" }] },
+      { role: "assistant", content: "Real assistant content" },
+      { role: "user", content: "Continue." },
+    ]);
+  });
+
+  it("drops the nudge then appends a user turn when it trails a real assistant turn", () => {
+    const out = stripAssistantPrefillForClaude([
+      { role: "user", content: [{ type: "text", text: "hello" }] },
+      { role: "assistant", content: "Real assistant content" },
+      { role: "assistant", content: "Continue with your tasks." },
+    ]);
+    assert.deepEqual(out, [
+      { role: "user", content: [{ type: "text", text: "hello" }] },
+      { role: "assistant", content: "Real assistant content" },
+      { role: "user", content: "Continue." },
+    ]);
+  });
+
+  it("ends on a user turn after opencode's max-steps assistant prefill", () => {
+    const maxSteps = "CRITICAL - MAXIMUM STEPS REACHED\n\nTools are disabled until next user input. Respond with text only.";
+    for (const content of [maxSteps, [{ type: "text", text: maxSteps }]]) {
+      const out = stripAssistantPrefillForClaude([
+        { role: "user", content: [{ type: "text", text: "hello" }] },
+        { role: "assistant", content },
+      ]);
+      assert.deepEqual(out, [
+        { role: "user", content: [{ type: "text", text: "hello" }] },
+        { role: "assistant", content },
+        { role: "user", content: "Continue." },
+      ]);
+    }
+  });
+
+  it("leaves a user-tailed conversation unchanged", () => {
+    const input = [
+      { role: "assistant", content: "earlier answer" },
+      { role: "user", content: [{ type: "text", text: "hello" }] },
     ];
-    assert.deepEqual(stripAssistantPrefillForClaude(input), input);
+    const out = stripAssistantPrefillForClaude(input);
+    // Assert against a fresh literal (not the same reference) so the test would
+    // fail if the function mutated the input or appended a synthetic turn.
+    assert.deepEqual(out, [
+      { role: "assistant", content: "earlier answer" },
+      { role: "user", content: [{ type: "text", text: "hello" }] },
+    ]);
+    assert.equal(out.length, 2);
   });
 });
 
@@ -189,6 +237,59 @@ describe("system cache control", () => {
       { type: "text", text: "a" },
       { type: "text", text: "b" },
     ]);
+  });
+});
+
+describe("message cache control (tail breakpoint)", () => {
+  it("preserves the tail message's text cache_control but strips earlier ones", () => {
+    const messages = [
+      {
+        role: "user",
+        content: [{ type: "text", text: "old", cache_control: { type: "ephemeral" } }],
+      },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "mid", cache_control: { type: "ephemeral" } }],
+      },
+      {
+        role: "user",
+        content: [{ type: "text", text: "tail", cache_control: { type: "ephemeral" } }],
+      },
+    ];
+    stripMessageCacheControlPreservingTail(messages);
+    // Earlier messages: cache_control stripped.
+    assert.equal("cache_control" in messages[0].content[0], false);
+    assert.equal("cache_control" in messages[1].content[0], false);
+    // Tail message: cache_control preserved (the surviving breakpoint).
+    assert.deepEqual(messages[2].content[0].cache_control, { type: "ephemeral" });
+  });
+
+  it("preserves a tail breakpoint even when the tail block is text (text-tailed request)", () => {
+    const messages = [
+      { role: "user", content: [{ type: "text", text: "q", cache_control: { type: "ephemeral" } }] },
+    ];
+    stripMessageCacheControlPreservingTail(messages);
+    assert.deepEqual(messages[0].content[0].cache_control, { type: "ephemeral" });
+  });
+
+  it("leaves non-text blocks and messages without content untouched", () => {
+    const messages: Array<{ role: string; content?: unknown }> = [
+      {
+        role: "user",
+        content: [
+          { type: "tool_result", tool_use_id: "t1", content: "r", cache_control: { type: "ephemeral" } },
+          { type: "text", text: "x", cache_control: { type: "ephemeral" } },
+        ],
+      },
+      { role: "assistant", content: undefined },
+      { role: "user", content: [{ type: "text", text: "tail" }] },
+    ];
+    stripMessageCacheControlPreservingTail(messages);
+    const first = messages[0].content as Array<Record<string, unknown>>;
+    // Non-text block: never stripped.
+    assert.deepEqual(first[0].cache_control, { type: "ephemeral" });
+    // Earlier text block: stripped.
+    assert.equal("cache_control" in first[1], false);
   });
 });
 
