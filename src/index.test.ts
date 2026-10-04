@@ -9,7 +9,7 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -2273,10 +2273,12 @@ describe("bridge fetch wrapper", () => {
       messageCalls.push(url);
       sentBodies.push(String(init?.body));
       const reply = replies[Math.min(messageCalls.length - 1, replies.length - 1)];
-      return new Response(JSON.stringify({ type: reply.status === 200 ? "message" : "error" }), {
-        status: reply.status,
-        headers: reply.retryAfter === undefined ? {} : { "retry-after": reply.retryAfter },
-      });
+      const body = reply.status === 200
+        ? { type: "message" }
+        : { type: "error", error: { type: "api_error", message: `failure ${reply.status}` } };
+      const headers: Record<string, string> = { "request-id": `req_${messageCalls.length}` };
+      if (reply.retryAfter !== undefined) headers["retry-after"] = reply.retryAfter;
+      return new Response(JSON.stringify(body), { status: reply.status, headers });
     }) as typeof fetch;
 
     try {
@@ -2295,7 +2297,9 @@ describe("bridge fetch wrapper", () => {
         body: JSON.stringify(requestBody),
         signal,
       });
-      return { status: response.status, calls: messageCalls.length, sentBodies };
+      const errorLogPath = join(scratchDir, "data", "opencode", "log", "claude-bridge-api-errors.log");
+      const errorLog = existsSync(errorLogPath) ? readFileSync(errorLogPath, "utf8") : "";
+      return { status: response.status, calls: messageCalls.length, sentBodies, errorLog };
     } finally {
       globalThis.fetch = originalFetch;
       for (const [name, value] of Object.entries(originalEnv)) {
@@ -2326,6 +2330,20 @@ describe("bridge fetch wrapper", () => {
   it("does not retry other errors", async () => {
     const { status, calls } = await sendThroughBridge([{ status: 500 }]);
     assert.deepEqual({ status, calls }, { status: 500, calls: 1 });
+  });
+
+  it("records the final failed response in the API error log", async () => {
+    const { status, errorLog } = await sendThroughBridge([{ status: 529, retryAfter: "0" }, { status: 500 }]);
+    assert.equal(status, 500);
+    // Only the response returned to opencode is logged, not the retried ones.
+    assert.match(errorLog, /status=500 url=https:\/\/api\.anthropic\.com\/v1\/messages\S* request-id=req_2/);
+    assert.match(errorLog, /response: .*failure 500/);
+    assert.doesNotMatch(errorLog, /status=529/);
+  });
+
+  it("logs nothing for a successful response", async () => {
+    const { errorLog } = await sendThroughBridge([{ status: 200 }]);
+    assert.equal(errorLog, "");
   });
 
   it("rewrites a request whose system prompt is a plain string", async () => {

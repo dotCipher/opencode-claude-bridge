@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { hostname, userInfo } from "node:os";
-import { join } from "node:path";
+import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { homedir, hostname, userInfo } from "node:os";
+import { dirname, join } from "node:path";
 import {
   createAuthorizationRequest,
   exchangeCodeForTokens,
@@ -358,6 +358,46 @@ export function getInboundToolNameMapForActiveOpenCodeTools(
 const oauthProfileCache = new Map<string, Promise<OAuthProfile | null>>();
 const SYSTEM_PROMPT_CACHE_PATH = process.env.ANTHROPIC_SYSTEM_PROMPT_PATH
   || join(process.env.HOME || "", ".cache", "opencode-claude-bridge", "claude-system-prompt.json");
+
+/**
+ * Where failed API responses are recorded, next to opencode's own logs.
+ * opencode only surfaces a one-line summary of a failed request; the full
+ * error body and request id are what a bug report needs.
+ */
+function getApiErrorLogPath(): string {
+  const dataHome = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
+  return join(dataHome, "opencode", "log", "claude-bridge-api-errors.log");
+}
+
+/** Record a failed API response on stderr and in the error log; never throws. */
+async function logApiErrorResponse(response: Response, requestUrl: string): Promise<void> {
+  try {
+    const requestId = response.headers.get("request-id") || response.headers.get("x-request-id");
+    const responseBody = await response.clone().text();
+    const statusLine = `[opencode-claude-bridge] API error status=${response.status} url=${requestUrl}`
+      + (requestId ? ` request-id=${requestId}` : "");
+
+    console.error(statusLine);
+    if (responseBody) {
+      console.error(`[opencode-claude-bridge] API error response: ${responseBody.slice(0, 8000)}`);
+    }
+
+    try {
+      const logPath = getApiErrorLogPath();
+      mkdirSync(dirname(logPath), { recursive: true });
+      const entry = [
+        `time=${new Date().toISOString()}`,
+        statusLine,
+        responseBody ? `response: ${responseBody}` : "",
+      ].filter(Boolean).join("\n");
+      appendFileSync(logPath, `${entry}\n\n`, "utf8");
+    } catch (err) {
+      console.error(`[opencode-claude-bridge] Failed to write the API error log: ${err}`);
+    }
+  } catch (err) {
+    console.error(`[opencode-claude-bridge] Failed to read the API error response: ${err}`);
+  }
+}
 
 function buildAuthFailureResponse(detail: string): Response {
   const message = [
@@ -1169,6 +1209,8 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
               await waitForRetry(delayMs, init?.signal);
               response = await doFetch();
             }
+
+            if (!response.ok) await logApiErrorResponse(response, finalUrl);
 
             // ── Map Claude-style tool names and arguments back to OpenCode ──
             return wrapAnthropicResponseWithSse(response, inboundToolNameMap);
