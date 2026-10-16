@@ -75,11 +75,21 @@ export const USER_AGENT =
   process.env.ANTHROPIC_USER_AGENT ||
   `claude-cli/${CLI_VERSION} (external, ${ENTRYPOINT})`;
 
-// Exact beta flags from Claude Code 2.1.178 (confirmed via request interception)
+// Beta flags matching Claude Code 2.1.x (confirmed via request interception).
 // oauth-2025-04-20 is added separately only for OAuth auth.
+//
+// 2026-10-16: added thinking-binding-controls-2026-08-01 (present in Claude
+// Code ≥2.1.2xx). It legalizes the `thinking.block_binding` request field,
+// which OpenCode v2 sends natively for models flagged
+// supportsThinkingBlockBinding (claude-haiku-5-5, opus/sonnet/fable 5.x).
+// Without this flag those requests fail validation with:
+//   "thinking.adaptive.block_binding: Extra inputs are not permitted"
+// To refresh this list against a newer Claude Code install:
+//   grep -aoE '"[a-z]+(-[a-z]+)*-20[0-9]{2}-[0-9]{2}-[0-9]{2}"' \
+//     "$(readlink -f "$(command -v claude)")" | sort -u
 export const BETA_FLAGS =
   process.env.ANTHROPIC_BETA_FLAGS ||
-  "interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,claude-code-20250219,advisor-tool-2026-03-01,effort-2025-11-24,extended-cache-ttl-2025-04-11";
+  "interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,claude-code-20250219,advisor-tool-2026-03-01,effort-2025-11-24,extended-cache-ttl-2025-04-11,thinking-binding-controls-2026-08-01";
 
 export const OAUTH_BETA_FLAG = "oauth-2025-04-20";
 
