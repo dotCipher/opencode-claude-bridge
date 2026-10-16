@@ -1227,16 +1227,75 @@ describe("rewriteSystemBlocksForModel", () => {
 });
 
 describe("plugin module shape", () => {
-  it("default-exports { id, server } so opencode's loader recognises it", () => {
+  it("default-exports { id, setup, server } so opencode's loader recognises it", () => {
     // A bare function default export sends opencode down its legacy path, where
     // it calls every named export of this module as a plugin factory — which
     // crashes on the helpers above and takes the whole plugin down with it.
+    // `server` keeps the V1 implementation on opencode >= 1.18; `setup` adds
+    // opencode >= 2, which ignores `server` and never runs V1 hooks.
     assert.equal(typeof pluginModule, "object");
     assert.equal(typeof pluginModule.server, "function");
+    assert.equal(typeof pluginModule.setup, "function");
   });
 
   it("carries an id, which opencode requires for path-referenced plugins", () => {
     assert.equal(pluginModule.id, "opencode-claude-bridge");
+  });
+
+  it("v2 setup registers the anthropic oauth method override and provider-scoped hooks", async () => {
+    const registrations: string[] = [];
+    const methodUpdate = { capture: null as unknown };
+    const hooks: Array<{ name: string; options?: { providerID?: string } }> = [];
+    const ctx = {
+      integration: {
+        transform: async (editor: (editor: {
+          method: {
+            update(registration: Record<string, unknown>): void;
+          };
+        }) => void) => {
+          editor({
+            method: {
+              update(registration: Record<string, unknown>) {
+                methodUpdate.capture = registration;
+                registrations.push("integration.transform");
+              },
+            },
+          });
+        },
+        connection: {
+          active: async () => undefined,
+          resolve: async () => undefined,
+        },
+      },
+      session: {
+        hook: async (name: string, _cb: unknown, options?: { providerID?: string }) => {
+          hooks.push({ name, options });
+          registrations.push(`session.hook(${name})`);
+        },
+      },
+    };
+    const cleanup = await (pluginModule.setup as (c: unknown) => Promise<unknown>)(ctx);
+
+    const registration = methodUpdate.capture as Record<string, unknown>;
+    assert.equal(registration.integrationID, "anthropic");
+    const method = registration.method as Record<string, unknown>;
+    assert.equal(method.id, "oauth");
+    assert.equal(method.type, "oauth");
+    assert.equal(typeof registration.authorize, "function");
+    assert.equal(typeof registration.refresh, "function");
+    // The refresh callback must be async — opencode calls .then() on its result
+    // (a plain-object return crashes the credential resolver).
+    assert.equal(
+      (registration.refresh as (...args: unknown[]) => unknown).constructor.name,
+      "AsyncFunction",
+      "refresh must be async so opencode can await it",
+    );
+
+    assert.deepEqual(
+      hooks.map((h) => `${h.name}:${h.options?.providerID ?? ""}`).sort(),
+      ["context:anthropic", "http.request:anthropic", "http.response:anthropic"],
+    );
+    assert.equal(typeof cleanup, "function");
   });
 });
 
