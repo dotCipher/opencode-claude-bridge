@@ -390,7 +390,7 @@ async function logApiErrorResponse(response: Response, requestUrl: string): Prom
         statusLine,
         responseBody ? `response: ${responseBody}` : "",
       ].filter(Boolean).join("\n");
-      appendFileSync(logPath, `${entry}\n\n`, "utf8");
+      appendFileSync(logPath, `${entry}\n\n`, { encoding: "utf8", mode: 0o600 });
     } catch (err) {
       console.error(`[opencode-claude-bridge] Failed to write the API error log: ${err}`);
     }
@@ -1910,13 +1910,16 @@ export function createOpenCodeClaudeBridgeV2(deps: V2BridgeDeps = {}) {
       ),
     );
 
-    // ── SSE tool-name/argument translation (response phase) ──
+    // ── SSE tool-name/argument translation & error logging (response phase) ──
     track(
       await ctx.session.hook(
         "http.response",
-        (event: { request: Request; response: Response }) => {
+        async (event: { request: Request; response: Response }) => {
           const inboundToolNameMap = inboundMaps.get(event.request);
           if (!inboundToolNameMap) return; // Not OAuth-rewritten — passthrough
+          if (!event.response.ok) {
+            await logApiErrorResponse(event.response, event.request.url);
+          }
           try {
             event.response = wrapAnthropicResponseWithSse(event.response, inboundToolNameMap);
           } catch (err) {
