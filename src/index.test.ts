@@ -1928,6 +1928,54 @@ describe("OpenCode v2 plugin (setup)", () => {
     assert.equal(apiKeyEvent.system[0].text, "Clean prompt");
   });
 
+  it("logs failed OAuth responses in http.response without touching API-key failures", async () => {
+    const tmpData = mkdtempSync(join(tmpdir(), "bridge-v2-errlog-"));
+    const prevXdg = process.env.XDG_DATA_HOME;
+    process.env.XDG_DATA_HOME = tmpData;
+    try {
+      const mock = createMockV2Context({
+        activeConnection: { type: "credential", id: "cred_1", method: "oauth" },
+        resolvedCredential: { type: "oauth", methodID: "oauth", ...validTokens },
+      });
+      const setup = createOpenCodeClaudeBridgeV2({
+        getClaudeTokens: () => validTokens,
+        readCachedClaudePromptCache: () => null,
+        fetchOAuthProfile: async () => null,
+      });
+      await setup(mock.ctx);
+
+      const reqEvent = {
+        request: new Request("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: { authorization: `Bearer ${validTokens.access}` },
+          body: JSON.stringify({ model: "claude-sonnet-4-6", messages: [{ role: "user", content: "hi" }] }),
+        }),
+      };
+      await mock.triggerHook("http.request", reqEvent);
+
+      const resEvent = {
+        request: reqEvent.request,
+        response: new Response('{"error":{"type":"overloaded_error","message":"Overloaded"}}', {
+          status: 529,
+          headers: { "request-id": "req_v2_529" },
+        }),
+      };
+      await mock.triggerHook("http.response", resEvent);
+      // Body remains readable downstream after logging
+      assert.ok((await resEvent.response.text()).includes("overloaded_error"));
+
+      const logPath = join(tmpData, "opencode", "log", "claude-bridge-api-errors.log");
+      assert.equal(existsSync(logPath), true);
+      const logged = readFileSync(logPath, "utf8");
+      assert.ok(logged.includes("status=529"));
+      assert.ok(logged.includes("request-id=req_v2_529"));
+    } finally {
+      if (prevXdg === undefined) delete process.env.XDG_DATA_HOME;
+      else process.env.XDG_DATA_HOME = prevXdg;
+      rmSync(tmpData, { recursive: true, force: true });
+    }
+  });
+
   it("interactive authorize supports mode:auto with submit paste and code fallback", async () => {
     const mock = createMockV2Context();
     let closed = false;

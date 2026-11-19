@@ -285,14 +285,16 @@ Key things that have changed across versions:
 
 ```
 src/
-  index.ts          — Main plugin entry point: tool replacement, request/response
-                      transformation, bidirectional parameter translation (~886 lines)
-  claude-tools.ts   — 24 Claude Code tool definitions, fingerprint computation,
-                      parameter translation maps (~757 lines)
-  constants.ts      — Version strings, URLs, env overrides, header values (117 lines)
-  keychain.ts       — macOS Keychain access for OAuth tokens
-  oauth.ts          — OAuth PKCE flow with local callback server
-  retry.ts          — Retry policy for API responses and the token endpoint
+  index.ts          — Main plugin entry point (dual v1 server() + v2 setup()):
+                      OAuth integration, request/response rewriting, system prompt
+                      shaping, and API error logging
+  claude-tools.ts   — Claude Code tool definitions, fingerprint computation,
+                      and bidirectional parameter translation maps
+  stream.ts         — Stateful SSE frame processor for inbound tool_use translation
+  retry.ts          — Retry policy for 429/529 API and token-endpoint responses
+  constants.ts      — Version strings, URLs, env overrides, header values
+  keychain.ts       — macOS Keychain & ~/.claude/.credentials.json token lookup
+  oauth.ts          — OAuth PKCE flow with CSRF-protected local callback server
 
 scripts/
   validate-opencode-oauth.js  — Side-by-side wire comparison tool
