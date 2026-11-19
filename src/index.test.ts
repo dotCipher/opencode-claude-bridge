@@ -17,18 +17,26 @@ import {
   AGENT_TYPE_OPENCODE_TO_CLAUDE,
   shouldUseClaudeToolSchemas,
 } from "./claude-tools.js";
-import { extractOAuthErrorDetail } from "./oauth.js";
+import {
+  extractOAuthErrorDetail,
+  parseOAuthRedirect,
+  startOAuthCallbackServer,
+  type OAuthTokens,
+} from "./oauth.js";
 import { selectClaudeCredentials } from "./keychain.js";
 import {
+  createOpenCodeClaudeBridgeV2,
   default as pluginModule,
   deriveModelDisplayName,
   getClaudeToolsForActiveOpenCodeTools,
   getInboundToolNameMapForActiveOpenCodeTools,
+  isAnthropicApiUrl,
   mapOutboundToolName,
   rewriteSystemBlocksForModel,
   shouldInjectClaudeTools,
   stripAssistantPrefillForClaude,
   stripSystemCacheControl,
+  type V2PluginContext,
 } from "./index.js";
 import { createSseProcessor, parseSseEvent, buildSseEvent } from "./stream.js";
 
@@ -1293,9 +1301,719 @@ describe("plugin module shape", () => {
 
     assert.deepEqual(
       hooks.map((h) => `${h.name}:${h.options?.providerID ?? ""}`).sort(),
-      ["context:anthropic", "http.request:anthropic", "http.response:anthropic"],
+      [
+        "compaction:anthropic",
+        "context:anthropic",
+        "generate:anthropic",
+        "http.request:anthropic",
+        "http.response:anthropic",
+        "title:anthropic",
+      ],
     );
     assert.equal(typeof cleanup, "function");
+  });
+});
+
+describe("isAnthropicApiUrl security", () => {
+  it("accepts HTTPS anthropic.com and subdomains", () => {
+    assert.equal(isAnthropicApiUrl("https://api.anthropic.com/v1/messages", undefined), true);
+    assert.equal(isAnthropicApiUrl("https://anthropic.com/v1/messages", undefined), true);
+    assert.equal(isAnthropicApiUrl("https://us.api.anthropic.com/v1/messages", undefined), true);
+  });
+
+  it("rejects suffix-spoofed domains and plaintext HTTP", () => {
+    assert.equal(isAnthropicApiUrl("https://evilanthropic.com/v1/messages", undefined), false);
+    assert.equal(isAnthropicApiUrl("https://anthropic.com.evil.example/v1/messages", undefined), false);
+    assert.equal(isAnthropicApiUrl("http://api.anthropic.com/v1/messages", undefined), false);
+    assert.equal(isAnthropicApiUrl("https://api.openai.com/v1/responses", undefined), false);
+    assert.equal(isAnthropicApiUrl("not-a-url", undefined), false);
+  });
+
+  it("allows explicitly configured HTTPS or loopback HTTP ANTHROPIC_BASE_URL only", () => {
+    assert.equal(
+      isAnthropicApiUrl("http://127.0.0.1:43210/v1/messages", "http://127.0.0.1:43210"),
+      true,
+    );
+    assert.equal(
+      isAnthropicApiUrl("http://127.0.0.1:43210/v1/messages", undefined),
+      false,
+    );
+    assert.equal(
+      isAnthropicApiUrl("https://proxy.corp.internal/v1/messages", "https://proxy.corp.internal"),
+      true,
+    );
+    assert.equal(
+      isAnthropicApiUrl("http://proxy.corp.internal/v1/messages", "http://proxy.corp.internal"),
+      false,
+    );
+    assert.equal(
+      isAnthropicApiUrl("https://other.corp.internal/v1/messages", "https://proxy.corp.internal"),
+      false,
+    );
+  });
+});
+
+describe("OAuth CSRF state & redirect paste security", () => {
+  it("parseOAuthRedirect accepts matching state and extracts code or error", () => {
+    assert.deepEqual(
+      parseOAuthRedirect("http://localhost:9999/callback?code=abc123&state=s-good", "s-good"),
+      { code: "abc123" },
+    );
+    assert.deepEqual(
+      parseOAuthRedirect(
+        "http://localhost:9999/callback?error=access_denied&error_description=Denied&state=s-good",
+        "s-good",
+      ),
+      { error: "Denied" },
+    );
+  });
+
+  it("parseOAuthRedirect rejects mismatched state, malformed URL, or missing code", () => {
+    assert.throws(
+      () => parseOAuthRedirect("http://localhost:9999/callback?code=abc&state=wrong", "s-good"),
+      /different sign-in/,
+    );
+    assert.throws(
+      () => parseOAuthRedirect("http://localhost:9999/callback?code=abc", "s-good"),
+      /different sign-in/,
+    );
+    assert.throws(
+      () => parseOAuthRedirect("not a url", "s-good"),
+      /full URL/,
+    );
+    assert.throws(
+      () => parseOAuthRedirect("http://localhost:9999/callback?state=s-good", "s-good"),
+      /authorization code/,
+    );
+  });
+
+  it("callback server rejects forged/missing state without aborting legitimate callback", async () => {
+    const server = await startOAuthCallbackServer();
+    try {
+      const codePromise = server.waitForCode();
+
+      // Forged request with wrong state gets 400 and does NOT settle the attempt
+      const forged = await fetch(`http://localhost:${server.port}/callback?code=evil&state=wrong`);
+      assert.equal(forged.status, 400);
+
+      // Missing state also gets 400
+      const missing = await fetch(`http://localhost:${server.port}/callback?code=evil`);
+      assert.equal(missing.status, 400);
+
+      // Legitimate callback with matching state succeeds
+      const ok = await fetch(
+        `http://localhost:${server.port}/callback?code=legit-code&state=${encodeURIComponent(server.state)}`,
+      );
+      assert.equal(ok.status, 200);
+      assert.equal(await codePromise, "legit-code");
+
+      // Duplicate callback after settlement gets 409
+      const dup = await fetch(
+        `http://localhost:${server.port}/callback?code=second&state=${encodeURIComponent(server.state)}`,
+      );
+      assert.equal(dup.status, 409);
+    } finally {
+      server.close();
+    }
+  });
+
+  it("callback server submitRedirect settles waitForCode on valid state and rejects bad pastes", async () => {
+    const server = await startOAuthCallbackServer();
+    try {
+      const codePromise = server.waitForCode();
+
+      // Bad paste throws without aborting waitForCode
+      assert.throws(
+        () => server.submitRedirect("http://localhost:1234/callback?code=evil&state=bad"),
+        /different sign-in/,
+      );
+
+      // Good paste resolves waitForCode
+      server.submitRedirect(
+        `http://localhost:${server.port}/callback?code=pasted-code&state=${encodeURIComponent(server.state)}`,
+      );
+      assert.equal(await codePromise, "pasted-code");
+    } finally {
+      server.close();
+    }
+  });
+});
+
+// ── Test harness for OpenCode v2 plugin ────────────────────────────
+
+type MockV2Options = {
+  activeConnection?: { type: "credential"; id: string; label?: string; method?: string } | { type: "env"; name: string };
+  resolvedCredential?: { type: string; access?: string; refresh?: string; expires?: number; key?: string; methodID?: string };
+};
+
+function createMockV2Context(opts: MockV2Options = {}) {
+  const state = {
+    activeConnection: opts.activeConnection,
+    resolvedCredential: opts.resolvedCredential,
+  };
+  const disposed: string[] = [];
+  const connectCalls: Array<{ integrationID: string; methodID: string; label?: string }> = [];
+  let oauthRegistration: {
+    integrationID: string;
+    method: { id: string; type: "oauth"; label: string };
+    authorize: () => Promise<any>;
+    refresh: (cred: any) => Promise<any>;
+  } | null = null;
+  const hooks = new Map<string, Array<{ cb: (event: any) => any; providerID?: string }>>();
+
+  const ctx: V2PluginContext = {
+    integration: {
+      transform: async (editor) => {
+        editor({
+          method: {
+            update(registration) {
+              oauthRegistration = registration;
+            },
+          },
+        });
+        return {
+          dispose: async () => {
+            disposed.push("integration.transform");
+          },
+        };
+      },
+      oauth: {
+        connect: async (input) => {
+          connectCalls.push(input);
+          if (oauthRegistration) {
+            const auth = await oauthRegistration.authorize();
+            if (auth.mode === "auto") {
+              const cred = await auth.callback;
+              state.activeConnection = {
+                type: "credential",
+                id: "cred_bootstrapped",
+                label: input.label ?? "Claude CLI",
+                method: "oauth",
+              };
+              state.resolvedCredential = cred;
+            }
+          }
+          return { attemptID: "att_1" };
+        },
+      },
+      connection: {
+        active: async () => state.activeConnection,
+        resolve: async () => state.resolvedCredential,
+      },
+    },
+    session: {
+      hook: async (name, cb, options) => {
+        const list = hooks.get(name) ?? [];
+        list.push({ cb, providerID: options?.providerID });
+        hooks.set(name, list);
+        return {
+          dispose: async () => {
+            disposed.push(`session.hook:${name}`);
+          },
+        };
+      },
+    },
+  };
+
+  return {
+    ctx,
+    state,
+    disposed,
+    connectCalls,
+    getOAuthRegistration: () => oauthRegistration,
+    triggerHook: async (name: string, event: any) => {
+      for (const entry of hooks.get(name) ?? []) {
+        await entry.cb(event);
+      }
+      return event;
+    },
+  };
+}
+
+describe("OpenCode v2 plugin (setup)", () => {
+  const validTokens: OAuthTokens = {
+    access: "sk-ant-oat01-valid-token",
+    refresh: "sk-ant-ort01-valid-refresh",
+    expires: Date.now() + 3_600_000,
+  };
+
+  it("seamlessly bootstraps keychain credentials when no Anthropic connection exists", async () => {
+    const mock = createMockV2Context();
+    let callbackServerStarted = false;
+    const setup = createOpenCodeClaudeBridgeV2({
+      getClaudeTokens: () => validTokens,
+      startOAuthCallbackServer: async () => {
+        callbackServerStarted = true;
+        throw new Error("should not start callback server during keychain bootstrap");
+      },
+      readCachedClaudePromptCache: () => null,
+      fetchOAuthProfile: async () => null,
+    });
+
+    const cleanup = await setup(mock.ctx);
+    assert.equal(mock.connectCalls.length, 1);
+    assert.deepEqual(mock.connectCalls[0], {
+      integrationID: "anthropic",
+      methodID: "oauth",
+      label: "Claude CLI",
+    });
+    assert.equal(callbackServerStarted, false);
+    assert.equal(mock.state.activeConnection?.type, "credential");
+    assert.equal(mock.state.resolvedCredential?.type, "oauth");
+    assert.equal(mock.state.resolvedCredential?.access, validTokens.access);
+
+    await cleanup();
+    assert.ok(mock.disposed.includes("integration.transform"));
+    assert.ok(mock.disposed.includes("session.hook:http.request"));
+    assert.ok(mock.disposed.includes("session.hook:http.response"));
+    assert.ok(mock.disposed.includes("session.hook:context"));
+  });
+
+  it("never hijacks an existing env or key Anthropic connection during bootstrap", async () => {
+    for (const activeConnection of [
+      { type: "env" as const, name: "ANTHROPIC_API_KEY" },
+      { type: "credential" as const, id: "cred_key", label: "My API Key", method: "key" },
+      { type: "credential" as const, id: "cred_oauth", label: "Existing OAuth", method: "oauth" },
+    ]) {
+      const mock = createMockV2Context({
+        activeConnection,
+        resolvedCredential:
+          activeConnection.type === "credential" && activeConnection.method === "oauth"
+            ? { type: "oauth", methodID: "oauth", ...validTokens }
+            : { type: "key", key: "sk-ant-api03-secret" },
+      });
+      const setup = createOpenCodeClaudeBridgeV2({
+        getClaudeTokens: () => validTokens,
+        readCachedClaudePromptCache: () => null,
+        fetchOAuthProfile: async () => null,
+      });
+      await setup(mock.ctx);
+      assert.equal(mock.connectCalls.length, 0);
+    }
+  });
+
+  it("rewrites OAuth requests and translates SSE tool calls while preserving API-key passthrough", async () => {
+    const mock = createMockV2Context({
+      activeConnection: { type: "credential", id: "cred_1", method: "oauth" },
+      resolvedCredential: { type: "oauth", methodID: "oauth", ...validTokens },
+    });
+    const setup = createOpenCodeClaudeBridgeV2({
+      getClaudeTokens: () => validTokens,
+      readCachedClaudePromptCache: () => null,
+      fetchOAuthProfile: async () => ({ account: { uuid: "acct-uuid-123" } }),
+    });
+    await setup(mock.ctx);
+
+    // 1. OAuth request gets rewritten
+    const originalBody = JSON.stringify({
+      model: "claude-sonnet-4-6",
+      system: [{ type: "text", text: "You are OpenCode." }],
+      messages: [{ role: "user", content: "Read README.md please" }],
+      tools: [
+        {
+          name: "read",
+          description: "Read file",
+          input_schema: { type: "object", properties: { filePath: { type: "string" } } },
+        },
+      ],
+    });
+    const reqEvent = {
+      request: new Request("https://api.anthropic.com/messages", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${validTokens.access}`,
+          "x-api-key": "should-be-stripped",
+        },
+        body: originalBody,
+      }),
+    };
+    await mock.triggerHook("http.request", reqEvent);
+
+    assert.equal(reqEvent.request.url, "https://api.anthropic.com/v1/messages?beta=true");
+    assert.equal(reqEvent.request.headers.get("authorization"), `Bearer ${validTokens.access}`);
+    assert.equal(reqEvent.request.headers.get("x-api-key"), null);
+    assert.equal(reqEvent.request.headers.get("x-app"), "cli");
+    assert.ok(reqEvent.request.headers.get("anthropic-beta")?.includes("oauth-2025-04-20"));
+    assert.ok(reqEvent.request.headers.get("anthropic-beta")?.includes("thinking-binding-controls-2026-08-01"));
+
+    const rewrittenBody = JSON.parse(await reqEvent.request.clone().text());
+    assert.deepEqual(rewrittenBody.thinking, { type: "adaptive" });
+    assert.ok(rewrittenBody.system[0].text.startsWith("x-anthropic-billing-header:"));
+    assert.equal(rewrittenBody.tools[0].name, "Read");
+    assert.ok(rewrittenBody.metadata.user_id.includes("acct-uuid-123"));
+
+    // 2. Concurrent API-key request while OAuth request is still in-flight:
+    // switch active connection to API key before OAuth response arrives.
+    mock.state.activeConnection = { type: "credential", id: "cred_key", method: "key" };
+    mock.state.resolvedCredential = { type: "key", key: "sk-ant-api03-user-key" };
+
+    const apiKeyReq = new Request("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": "sk-ant-api03-user-key",
+      },
+      body: JSON.stringify({ model: "claude-sonnet-4-6", messages: [{ role: "user", content: "hi" }] }),
+    });
+    const apiKeyReqEvent = { request: apiKeyReq };
+    await mock.triggerHook("http.request", apiKeyReqEvent);
+    // Must NOT hijack via keychain even though validTokens are available!
+    assert.equal(apiKeyReqEvent.request, apiKeyReq);
+    assert.equal(apiKeyReqEvent.request.headers.get("x-api-key"), "sk-ant-api03-user-key");
+    assert.equal(apiKeyReqEvent.request.headers.get("authorization"), null);
+
+    // 3. Responses arrive out of order: OAuth response MUST still be SSE-translated
+    // while API-key response MUST pass through untouched (regression for oauthMode race).
+    const ssePayload =
+      'event: content_block_start\n' +
+      'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"Read","input":{}}}\n\n' +
+      'event: content_block_delta\n' +
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"file_path\\":\\"/tmp/a.txt\\"}"}}\n\n' +
+      'event: content_block_stop\n' +
+      'data: {"type":"content_block_stop","index":0}\n\n';
+
+    const oauthResEvent = {
+      request: reqEvent.request,
+      response: new Response(ssePayload, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    };
+    await mock.triggerHook("http.response", oauthResEvent);
+    const oauthOut = await oauthResEvent.response.text();
+    assert.ok(oauthOut.includes('"name":"read"'), "OAuth SSE tool name should map Read -> read");
+    assert.ok(oauthOut.includes("filePath"), "OAuth SSE args should map file_path -> filePath");
+
+    const apiKeyRes = new Response(ssePayload, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+    const apiKeyResEvent = { request: apiKeyReqEvent.request, response: apiKeyRes };
+    await mock.triggerHook("http.response", apiKeyResEvent);
+    assert.equal(apiKeyResEvent.response, apiKeyRes, "API-key response must not be wrapped");
+  });
+
+  it("never rewrites non-Anthropic hosts or cleartext HTTP even with OAuth active", async () => {
+    const mock = createMockV2Context({
+      activeConnection: { type: "credential", id: "cred_1", method: "oauth" },
+      resolvedCredential: { type: "oauth", methodID: "oauth", ...validTokens },
+    });
+    const setup = createOpenCodeClaudeBridgeV2({
+      getClaudeTokens: () => validTokens,
+      readCachedClaudePromptCache: () => null,
+      fetchOAuthProfile: async () => null,
+      configuredBaseUrl: undefined,
+    });
+    await setup(mock.ctx);
+
+    for (const badUrl of [
+      "https://evilanthropic.com/v1/messages",
+      "http://api.anthropic.com/v1/messages",
+      "https://api.openai.com/v1/responses",
+    ]) {
+      const req = new Request(badUrl, { method: "POST", body: "{}" });
+      const event = { request: req };
+      await mock.triggerHook("http.request", event);
+      assert.equal(event.request, req, `must not rewrite ${badUrl}`);
+      assert.equal(event.request.headers.get("authorization"), null);
+    }
+  });
+
+  it("never hijacks x-api-key header requests when no integration connection exists", async () => {
+    const mock = createMockV2Context();
+    const setup = createOpenCodeClaudeBridgeV2({
+      getClaudeTokens: () => validTokens,
+      readCachedClaudePromptCache: () => null,
+      fetchOAuthProfile: async () => null,
+    });
+    // Simulate no oauth.connect so activeConnection remains undefined
+    delete (mock.ctx.integration as { oauth?: unknown }).oauth;
+    await setup(mock.ctx);
+
+    const req = new Request("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "x-api-key": "sk-ant-api03-direct" },
+      body: "{}",
+    });
+    const event = { request: req };
+    await mock.triggerHook("http.request", event);
+    assert.equal(event.request, req);
+    assert.equal(event.request.headers.get("x-api-key"), "sk-ant-api03-direct");
+  });
+
+  it("system prompt hooks inject Claude prefix in OAuth mode and skip in API-key mode", async () => {
+    const mock = createMockV2Context({
+      activeConnection: { type: "credential", id: "cred_1", method: "oauth" },
+      resolvedCredential: { type: "oauth", methodID: "oauth", ...validTokens },
+    });
+    const setup = createOpenCodeClaudeBridgeV2({
+      getClaudeTokens: () => validTokens,
+      readCachedClaudePromptCache: () => null,
+      fetchOAuthProfile: async () => null,
+    });
+    await setup(mock.ctx);
+
+    for (const hookName of ["context", "compaction", "generate", "title"]) {
+      const event = {
+        system: [{ type: "text", text: "Base prompt", metadata: { tag: "keep" } }],
+      };
+      await mock.triggerHook(hookName, event);
+      assert.ok(event.system[0].text.startsWith("You are a Claude agent, built on Anthropic's Claude Agent SDK.\n\nBase prompt"));
+      assert.deepEqual(event.system[0].metadata, { tag: "keep" });
+
+      // Idempotent on second call
+      await mock.triggerHook(hookName, event);
+      assert.equal(event.system[0].text.match(/Claude Agent SDK/g)?.length, 1);
+    }
+
+    // Non-text first SystemPart is preserved instead of overwritten
+    const nonTextEvent = {
+      system: [{ type: "image", data: "abc" } as Record<string, unknown>],
+    };
+    await mock.triggerHook("context", nonTextEvent);
+    assert.equal(nonTextEvent.system.length, 2);
+    assert.equal(nonTextEvent.system[0].type, "text");
+    assert.equal(nonTextEvent.system[1].type, "image");
+
+    // Switch to API-key mode: system prompt must not be mutated
+    mock.state.activeConnection = { type: "env", name: "ANTHROPIC_API_KEY" };
+    mock.state.resolvedCredential = { type: "key", key: "sk-ant-api03-key" };
+    const apiKeyEvent = { system: [{ type: "text", text: "Clean prompt" }] };
+    await mock.triggerHook("context", apiKeyEvent);
+    assert.equal(apiKeyEvent.system[0].text, "Clean prompt");
+  });
+
+  it("interactive authorize supports mode:auto with submit paste and code fallback", async () => {
+    const mock = createMockV2Context();
+    let closed = false;
+    let submittedUrl = "";
+    let resolveCode!: (code: string) => void;
+    const exchanged: Array<{ code: string; verifier: string; redirectUri?: string }> = [];
+
+    const setup = createOpenCodeClaudeBridgeV2({
+      getClaudeTokens: () => null,
+      startOAuthCallbackServer: async () => ({
+        url: "https://claude.ai/oauth/authorize?state=s1",
+        manualUrl: "https://claude.ai/oauth/authorize?manual=1",
+        verifier: "v-pkce",
+        state: "s1",
+        port: 43210,
+        waitForCode: () => new Promise<string>((res) => { resolveCode = res; }),
+        submitRedirect: (redirectUrl: string) => {
+          submittedUrl = redirectUrl;
+          resolveCode("pasted-auth-code");
+        },
+        close: () => {
+          closed = true;
+        },
+      }),
+      exchangeCodeForTokens: (code, verifier, redirectUri) => {
+        exchanged.push({ code, verifier, redirectUri });
+        return validTokens;
+      },
+      readCachedClaudePromptCache: () => null,
+      fetchOAuthProfile: async () => null,
+    });
+    await setup(mock.ctx);
+
+    const reg = mock.getOAuthRegistration()!;
+    const auth = await reg.authorize();
+    assert.equal(auth.mode, "auto");
+    assert.equal(auth.url, "https://claude.ai/oauth/authorize?state=s1");
+    assert.equal(typeof auth.submit, "function");
+
+    await auth.submit("http://localhost:43210/callback?code=pasted-auth-code&state=s1");
+    const cred = await auth.callback;
+    assert.equal(submittedUrl, "http://localhost:43210/callback?code=pasted-auth-code&state=s1");
+    assert.equal(closed, true);
+    assert.deepEqual(exchanged, [
+      { code: "pasted-auth-code", verifier: "v-pkce", redirectUri: "http://localhost:43210/callback" },
+    ]);
+    assert.equal(cred.type, "oauth");
+    assert.equal(cred.methodID, "oauth");
+    assert.equal(cred.access, validTokens.access);
+  });
+
+  it("interactive authorize falls back to mode:code when callback server cannot bind", async () => {
+    const mock = createMockV2Context();
+    const setup = createOpenCodeClaudeBridgeV2({
+      getClaudeTokens: () => null,
+      startOAuthCallbackServer: async () => {
+        throw new Error("EACCES");
+      },
+      createAuthorizationRequest: () => ({
+        url: "https://claude.ai/oauth/authorize?state=s-manual",
+        verifier: "v-manual",
+        state: "s-manual",
+      }),
+      exchangeCodeForTokens: (code, verifier) => ({
+        access: `tok:${code}:${verifier}`,
+        refresh: "ref",
+        expires: Date.now() + 3_600_000,
+      }),
+      readCachedClaudePromptCache: () => null,
+      fetchOAuthProfile: async () => null,
+    });
+    await setup(mock.ctx);
+
+    const reg = mock.getOAuthRegistration()!;
+    const auth = await reg.authorize();
+    assert.equal(auth.mode, "code");
+    await assert.rejects(
+      () => auth.callback("https://platform.claude.com/oauth/code/callback?code=bad&state=wrong"),
+      /different sign-in/,
+    );
+    const cred = await auth.callback(
+      "https://platform.claude.com/oauth/code/callback?code=good-code&state=s-manual",
+    );
+    assert.equal(cred.access, "tok:good-code:v-manual");
+  });
+
+  it("refresh callback persists updated tokens and throws cleanly when all layers fail", async () => {
+    let nextTokens: OAuthTokens | null = {
+      access: "sk-ant-oat01-refreshed",
+      refresh: "sk-ant-ort01-refreshed",
+      expires: Date.now() + 7_200_000,
+    };
+    const mock = createMockV2Context();
+    const setup = createOpenCodeClaudeBridgeV2({
+      getClaudeTokens: () => null,
+      refreshTokensLayered: () => nextTokens,
+      readCachedClaudePromptCache: () => null,
+      fetchOAuthProfile: async () => null,
+    });
+    await setup(mock.ctx);
+
+    const reg = mock.getOAuthRegistration()!;
+    const refreshed = await reg.refresh({
+      type: "oauth",
+      methodID: "oauth",
+      access: "old",
+      refresh: "old-ref",
+      expires: 1,
+    });
+    assert.equal(refreshed.access, "sk-ant-oat01-refreshed");
+    assert.equal(refreshed.methodID, "oauth");
+
+    nextTokens = null;
+    await assert.rejects(
+      () => reg.refresh({ type: "oauth", methodID: "oauth", access: "old", refresh: "old-ref", expires: 1 }),
+      /All Claude OAuth refresh layers failed/,
+    );
+  });
+});
+
+describe("OpenCode v1 plugin (server)", () => {
+  it("system transform prefixes anthropic system prompts and ignores other providers", async () => {
+    const v1 = await pluginModule.server({
+      client: { auth: { set: async () => {} } },
+    });
+    const transform = v1["experimental.chat.system.transform"];
+
+    const nonAnthropic = { system: ["Keep untouched"] };
+    transform({ model: { providerID: "openai" } }, nonAnthropic);
+    assert.deepEqual(nonAnthropic.system, ["Keep untouched"]);
+
+    const anthropic = { system: ["Base prompt"] };
+    transform({ model: { providerID: "anthropic" } }, anthropic);
+    assert.ok(anthropic.system[0].startsWith("You are a Claude agent, built on Anthropic's Claude Agent SDK.\n\nBase prompt"));
+
+    // Idempotent
+    transform({ model: { providerID: "anthropic" } }, anthropic);
+    assert.equal(anthropic.system[0].match(/Claude Agent SDK/g)?.length, 1);
+  });
+
+  it("auth.loader passes through API-key auth without installing a custom fetch", async () => {
+    const savedApiKey = process.env.ANTHROPIC_API_KEY;
+    try {
+      const v1 = await pluginModule.server({
+        client: { auth: { set: async () => {} } },
+      });
+      const provider = { models: {} as Record<string, Record<string, unknown>> };
+      const result = await v1.auth.loader(
+        async () => ({ type: "apikey", access: "sk-ant-api03-v1-key" }),
+        provider,
+      );
+      assert.equal(result.fetch, undefined);
+      assert.equal(process.env.ANTHROPIC_API_KEY, "sk-ant-api03-v1-key");
+    } finally {
+      if (savedApiKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = savedApiKey;
+    }
+  });
+
+  it("auth.loader injects Claude models and rewrites OAuth fetch + SSE responses", async () => {
+    const savedApiKey = process.env.ANTHROPIC_API_KEY;
+    const savedFetch = globalThis.fetch;
+    try {
+      const v1 = await pluginModule.server({
+        client: { auth: { set: async () => {} } },
+      });
+
+      const provider = { models: {} as Record<string, Record<string, unknown>> };
+      const oauthAuth = {
+        type: "oauth",
+        access: "sk-ant-oat01-v1-token",
+        refresh: "sk-ant-ort01-v1-refresh",
+        expires: Date.now() + 3_600_000,
+      };
+      const loaderResult = await v1.auth.loader(async () => oauthAuth, provider);
+      assert.ok("claude-sonnet-4-6" in provider.models, "should inject ANTHROPIC_MODELS");
+      assert.equal(typeof loaderResult.fetch, "function");
+
+      let capturedUrl = "";
+      let capturedHeaders: Record<string, string> = {};
+      let capturedBody = "";
+      globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+        if (url.includes("/api/oauth/profile")) {
+          return new Response(JSON.stringify({ account: { uuid: "v1-acct-uuid" } }), { status: 200 });
+        }
+        capturedUrl = url;
+        capturedHeaders = (init?.headers ?? {}) as Record<string, string>;
+        capturedBody = String(init?.body ?? "");
+        const sse =
+          'event: content_block_start\n' +
+          'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"Read","input":{}}}\n\n' +
+          'event: content_block_delta\n' +
+          'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"file_path\\":\\"/tmp/v1.txt\\"}"}}\n\n' +
+          'event: content_block_stop\n' +
+          'data: {"type":"content_block_stop","index":0}\n\n';
+        return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
+      }) as typeof fetch;
+
+      const res = await loaderResult.fetch!("https://api.anthropic.com/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-api-key": "oauth-placeholder" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-6",
+          messages: [{ role: "user", content: "Hello" }],
+          tools: [
+            {
+              name: "read",
+              description: "Read file",
+              input_schema: { type: "object", properties: { filePath: { type: "string" } } },
+            },
+          ],
+        }),
+      });
+
+      assert.equal(capturedUrl, "https://api.anthropic.com/v1/messages?beta=true");
+      assert.equal(capturedHeaders["authorization"], "Bearer sk-ant-oat01-v1-token");
+      assert.equal(capturedHeaders["x-api-key"], undefined);
+      assert.ok(capturedHeaders["anthropic-beta"]?.includes("thinking-binding-controls-2026-08-01"));
+      const parsedOut = JSON.parse(capturedBody);
+      assert.equal(parsedOut.tools[0].name, "Read");
+
+      const text = await res.text();
+      assert.ok(text.includes('"name":"read"'));
+      assert.ok(text.includes("filePath"));
+    } finally {
+      globalThis.fetch = savedFetch;
+      if (savedApiKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = savedApiKey;
+    }
   });
 });
 

@@ -4,6 +4,24 @@ Use your Claude Pro/Max subscription in [OpenCode](https://opencode.ai). If you'
 
 ## Install
 
+### OpenCode v2 (recommended)
+
+Install via CLI:
+
+```bash
+opencode plugin add opencode-claude-bridge
+```
+
+Or add to `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "plugins": ["opencode-claude-bridge"]
+}
+```
+
+### OpenCode v1 (1.18.29 – 1.x)
+
 Add to `~/.config/opencode/opencode.json`:
 
 ```json
@@ -14,15 +32,12 @@ Add to `~/.config/opencode/opencode.json`:
 
 OpenCode auto-installs the plugin from npm on next launch.
 
-If you're logged into the Claude CLI (`claude login`), the plugin auto-syncs your credentials — just select an Anthropic model and start chatting. If not, you'll be prompted to authenticate via browser OAuth or enter an API key.
+If you're logged into the Claude CLI (`claude login`), the plugin auto-syncs your credentials — just select an Anthropic model and start chatting. If not, you'll be prompted to authenticate via browser OAuth (or `/connect` → Anthropic) or enter an API key.
 
 **Upgrade:**
 
-OpenCode pins the installed version. To upgrade to the latest:
-
-```bash
-cd ~/.cache/opencode && npm install opencode-claude-bridge@latest
-```
+- **OpenCode v2:** `opencode plugin update opencode-claude-bridge`
+- **OpenCode v1:** `cd ~/.cache/opencode && npm install opencode-claude-bridge@latest`
 
 Then restart OpenCode.
 
@@ -34,13 +49,20 @@ git clone https://github.com/dotCipher/opencode-claude-bridge.git ~/opencode-cla
 cd ~/opencode-claude-bridge && npm install && npm run build
 ```
 
-Then reference the full path in your config:
+Then reference the local path in your config:
 
-```json
-{
-  "plugin": ["/Users/YOU/opencode-claude-bridge/dist/index.js"]
-}
-```
+- **OpenCode v2** (must be the **directory**, not `dist/index.js`):
+  ```json
+  {
+    "plugins": ["/Users/YOU/opencode-claude-bridge"]
+  }
+  ```
+- **OpenCode v1**:
+  ```json
+  {
+    "plugin": ["/Users/YOU/opencode-claude-bridge/dist/index.js"]
+  }
+  ```
 </details>
 
 ## How the bridge works
@@ -148,19 +170,37 @@ The salt is hardcoded in Claude Code's source. This changes per conversation bec
 ## OpenCode v2 compatibility
 
 OpenCode 2.0 loads plugins through a new contract (`id` + `setup()`), and V1
-hooks never run there — the plugin fails with *"Plugin must export a default
+hooks never run there — older releases fail with *"Plugin must export a default
 definition with an id and an effect or setup function"*. This package supports
-both generations from one entrypoint:
+both generations from a single entrypoint (`{ id, setup, server }`):
 
-- **OpenCode ≥ 2.0** — uses `setup()`. The bridge registers an OAuth method
-  override on the built-in `anthropic` integration (authorize + layered
-  refresh, so `claude login` keeps auto-syncing) and rewrites requests through
-  the `http.request` / `http.response` hooks. No model injection: the v2
-  catalog already lists Claude models, and a stored OAuth credential
-  activates the provider. Reconnect via `/connect` → Anthropic if needed.
-- **OpenCode 1.18 – 1.x** — uses the V1 `server()` implementation as before.
+- **OpenCode ≥ 2.0** — uses `setup()`.
+  - Registers an OAuth method on the built-in `anthropic` integration with
+    keychain fast-path, browser PKCE (`mode: "auto"` + remote redirect-URL
+    paste with CSRF `state` verification), and layered refresh (keychain →
+    stored → CLI) persisted atomically by OpenCode.
+  - **Seamless sync:** when no Anthropic connection exists yet (neither a
+    stored credential nor `ANTHROPIC_API_KEY`) and you are logged into
+    `claude login`, the bridge automatically persists your keychain credential
+    on startup so Anthropic models appear immediately without running `/connect`.
+    Existing API keys are never overridden.
+  - Rewrites OAuth requests and SSE tool-call responses through
+    provider-scoped `http.request` / `http.response` and system prompt
+    (`context`, `compaction`, `generate`, `title`) hooks. Requests to
+    non-Anthropic hosts or with API-key auth pass through untouched.
+  - No model injection: the v2 catalog already lists Claude models.
+  - No inline 429 token rotation: Claude refresh tokens are single-use, so
+    rotation is restricted to OpenCode's persisted integration `refresh`
+    callback; OpenCode's native retry policy handles 429 backoff.
+- **OpenCode 1.18.29 – 1.x** — uses the V1 `server()` implementation as before.
 
-OpenCode < 1.18 is not supported by `main` (the `{ id, server }` entrypoint
+> **Note on OpenCode v2's built-in Claude Agent provider:** OpenCode v2 also
+> ships a native `claude-agent` provider that shells out to the local `claude`
+> CLI binary. Use this bridge if you want direct Anthropic API traffic through
+> OpenCode's native `anthropic` provider with Claude Code wire parity, tool
+> schema & SSE translation, and seamless coexistence with API-key configs.
+
+OpenCode < 1.18.29 is not supported by `main` (the `{ id, server }` entrypoint
 shape requires 1.18.29); use the 1.10.x releases there.
 
 ## Requirements
@@ -257,6 +297,8 @@ scripts/
 Anthropic's own Claude Code docs say third-party integrations should use API key authentication. This bridge can make OAuth requests look much closer to current Claude Code traffic, but Anthropic may still apply server-side classification that a bridge cannot fully control.
 
 ## Credits
+
+OpenCode v2 plugin port initiated by [@TomasRichtr](https://github.com/TomasRichtr) in [#37](https://github.com/dotCipher/opencode-claude-bridge/pull/37).
 
 Combines approaches from [shahidshabbir-se/opencode-anthropic-oauth](https://github.com/shahidshabbir-se/opencode-anthropic-oauth), [ex-machina-co/opencode-anthropic-auth](https://github.com/ex-machina-co/opencode-anthropic-auth), [vinzabe/PERMANENT-opencode-anthropic-oauth-fix](https://github.com/vinzabe/PERMANENT-opencode-anthropic-oauth-fix), and [lehdqlsl/opencode-claude-auth-sync](https://github.com/lehdqlsl/opencode-claude-auth-sync).
 
