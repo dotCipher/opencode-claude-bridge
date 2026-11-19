@@ -83,8 +83,8 @@ Supports both OAuth and API key auth:
 
 Every outbound OAuth request is rewritten to match what Claude Code sends on the wire:
 
-- **Headers** — `user-agent`, `anthropic-beta`, `anthropic-version`, `x-stainless-*`, `x-claude-code-version`, `x-claude-code-session-id`, and all billing metadata (`cc_version`, `cc_entrypoint`, `cch`).
-- **Body fields** — `thinking` (with effort and `clear_thinking`), `context_management`, `output_config`, `metadata` (session ID, billing info), and `?beta=true` URL parameter.
+- **Headers** — `user-agent`, `anthropic-beta` (merges required Claude Code/OAuth flags with any incoming SDK beta flags), `anthropic-version`, `x-stainless-*`, `x-claude-code-session-id`, and billing metadata (`cc_version`, `cc_entrypoint`, `cch`).
+- **Body fields** — `thinking` (with effort and `clear_thinking`), `context_management`, `output_config`, `metadata` (session ID, billing info), user-tail normalization (strips continuation nudges and ensures requests end on a user turn), tail `cache_control` breakpoint preservation, and `?beta=true` URL parameter.
 - **System prompt** — Claude Code's real system prompt is captured via the validator and cached at `~/.cache/opencode-claude-bridge/claude-system-prompt.json`. The bridge injects this as the system prompt for all requests. OpenCode's default system prompt is sanitized out.
 - **MCP tool prefixing** — OpenCode's MCP tools are prefixed with `mcp_` to match Claude Code's convention.
 
