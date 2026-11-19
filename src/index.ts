@@ -6,8 +6,10 @@ import {
   createAuthorizationRequest,
   exchangeCodeForTokens,
   parseAuthCode,
+  parseOAuthRedirect,
   refreshTokens,
   startOAuthCallbackServer,
+  type OAuthTokens,
 } from "./oauth.js";
 import { getClaudeTokens, readClaudeCredentials } from "./keychain.js";
 import {
@@ -423,6 +425,14 @@ async function refreshAuth(
 
 /** Best-effort browser open — tries multiple methods on each platform. */
 function openBrowser(url: string): void {
+  // Only open valid HTTPS URLs to prevent command/scheme injection.
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:") return;
+  } catch {
+    return;
+  }
+
   (async () => {
     const { execFileSync } = await import("node:child_process");
 
@@ -431,9 +441,17 @@ function openBrowser(url: string): void {
       const attempts: Array<[string, () => void]> = [
         ["launchctl asuser", () => execFileSync("/bin/launchctl", ["asuser", uid, "/usr/bin/open", url], { timeout: 5000 })],
         ["open", () => execFileSync("/usr/bin/open", [url], { timeout: 3000 })],
-        ["osascript", () => execFileSync("/usr/bin/osascript", ["-e", `open location "${url}"`], { timeout: 3000 })],
+        [
+          "osascript",
+          () =>
+            execFileSync(
+              "/usr/bin/osascript",
+              ["-e", "on run argv", "-e", "open location (item 1 of argv)", "-e", "end run", "--", url],
+              { timeout: 3000 },
+            ),
+        ],
       ];
-      for (const [name, attempt] of attempts) {
+      for (const [, attempt] of attempts) {
         try { attempt(); break; }
         catch {}
       }
@@ -445,7 +463,7 @@ function openBrowser(url: string): void {
         ["xdg-open", () => execFileSync("/usr/bin/xdg-open", [url], { timeout: 3000 })],
         ["open", () => execFileSync("/usr/bin/open", [url], { timeout: 3000 })],
       ];
-      for (const [name, attempt] of attempts) {
+      for (const [, attempt] of attempts) {
         try { attempt(); break; }
         catch {}
       }
@@ -840,6 +858,11 @@ function wrapAnthropicResponseWithSse(
             while (true) {
               const { done, value } = await reader.read();
               if (done) {
+                const decodedTail = decoder.decode();
+                if (decodedTail) {
+                  const out = processor.feedChunk(decodedTail);
+                  if (out) controller.enqueue(encoder.encode(out));
+                }
                 const tail = processor.flush();
                 if (tail) controller.enqueue(encoder.encode(tail));
                 controller.close();
@@ -1207,9 +1230,9 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
 // ── OpenCode v2 plugin ─────────────────────────────────────────────
 // opencode ≥ 2.0 loads plugins through a different contract: the default
 // export must carry an `id` plus a `setup(ctx)` (Promise) or `effect(ctx)`
-// (Effect) function, and V1 hooks never run. The `server()` shape below keeps
-// the V1 implementation working on opencode ≥ 1.18.29; `setup` adds v2 by
-// mapping the same behavior onto the v2 APIs:
+// (Effect) function, and V1 hooks never run. The `server()` shape keeps the
+// V1 implementation working on opencode ≥ 1.18.29; `setup` adds v2 by mapping
+// the same behavior onto the v2 APIs:
 //
 //   V1                                    → V2
 //   auth.loader (custom fetch)            → session.hook("http.request")
@@ -1217,8 +1240,11 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
 //   auth.methods (OAuth)                  → integration.transform, method
 //                                           override on `anthropic` with
 //                                           authorize + refresh callbacks
+//   keychain bootstrap at init            → integration.oauth.connect (when
+//                                           no anthropic connection exists)
 //   auth.methods (API key)                → native /connect (passthrough)
-//   experimental.chat.system.transform    → session.hook("context")
+//   experimental.chat.system.transform    → session.hook("context" |
+//                                           "compaction" | "generate" | "title")
 //
 // Deliberate divergences from the V1 implementation under v2:
 //   - No model injection: the v2 models.dev catalog already lists Claude
@@ -1227,8 +1253,55 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
 //     rotating them anywhere but the integration `refresh` callback (whose
 //     result opencode persists) would invalidate the stored token. opencode's
 //     native retry policy handles 429 backoff.
-//   - Rewrites apply only to anthropic.com hosts; the v2 hooks observe every
-//     request, while the V1 fetch wrapper sat inside the provider SDK.
+//   - Rewrites apply strictly to HTTPS anthropic.com hosts (plus an explicitly
+//     configured HTTPS or loopback ANTHROPIC_BASE_URL); the v2 hooks observe
+//     every HTTP request for the provider, while the V1 fetch wrapper sat
+//     inside the provider SDK.
+
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+
+/**
+ * Strictly verify that a request URL targets Anthropic's HTTPS API (or an
+ * explicitly configured HTTPS / loopback `ANTHROPIC_BASE_URL` proxy) before
+ * attaching an OAuth bearer token or rewriting the payload.
+ *
+ * Prevents suffix-spoofing (e.g. `evilanthropic.com`) and plaintext HTTP
+ * token downgrade.
+ */
+export function isAnthropicApiUrl(
+  url: string,
+  configuredBaseUrl: string | undefined = process.env.ANTHROPIC_BASE_URL,
+): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+
+  const host = parsed.hostname.toLowerCase();
+  if (
+    parsed.protocol === "https:" &&
+    (host === "anthropic.com" || host.endsWith(".anthropic.com"))
+  ) {
+    return true;
+  }
+
+  if (configuredBaseUrl) {
+    try {
+      const base = new URL(configuredBaseUrl);
+      const baseHost = base.hostname.toLowerCase();
+      const allowedScheme =
+        base.protocol === "https:" ||
+        (base.protocol === "http:" && LOOPBACK_HOSTS.has(baseHost));
+      if (allowedScheme && parsed.origin === base.origin) {
+        return true;
+      }
+    } catch {}
+  }
+
+  return false;
+}
 
 type V2OAuthCredential = {
   type: "oauth";
@@ -1241,14 +1314,30 @@ type V2OAuthCredential = {
 type V2OAuthAuthorization = {
   url: string;
   instructions: string;
+  expiresAt?: number;
 } & (
-  | { mode: "auto"; callback: Promise<V2OAuthCredential> }
-  | { mode: "code"; callback: (code: string) => Promise<V2OAuthCredential> }
+  | {
+      mode: "auto";
+      callback: Promise<V2OAuthCredential>;
+      submit?: (redirect: string) => Promise<void>;
+    }
+  | {
+      mode: "code";
+      callback: (code: string) => Promise<V2OAuthCredential>;
+    }
 );
 
-// Structural subset of the v2 plugin context used here (kept local so the
-// package gains no runtime dependency on @opencode/plugin).
-type V2PluginContext = {
+type V2ConnectionInfo =
+  | { type: "credential"; id: string; label?: string; method?: string }
+  | { type: "env"; name: string };
+
+type V2Registration = {
+  dispose?: () => Promise<void> | void;
+};
+
+// Structural subset of @opencode/plugin's Context (v2.3.x), kept local so the
+// published package stays zero-dependency with a self-contained index.d.ts.
+export type V2PluginContext = {
   integration: {
     transform: (
       editor: (editor: {
@@ -1263,17 +1352,26 @@ type V2PluginContext = {
           }): void;
         };
       }) => void,
-    ) => Promise<unknown>;
+    ) => Promise<V2Registration | void>;
+    oauth?: {
+      connect: (input: {
+        integrationID: string;
+        methodID: string;
+        label?: string;
+      }) => Promise<unknown>;
+    };
     connection: {
-      active: (integrationID: string) => Promise<unknown>;
+      active: (integrationID: string) => Promise<V2ConnectionInfo | undefined>;
       resolve: (
-        connection: unknown,
+        connection: V2ConnectionInfo,
       ) => Promise<
         | {
             type?: string;
             access?: string;
             refresh?: string;
             expires?: number;
+            key?: string;
+            methodID?: string;
           }
         | undefined
       >;
@@ -1284,15 +1382,36 @@ type V2PluginContext = {
       name: string,
       callback: (event: any) => void | Promise<void>,
       options?: { providerID?: string },
-    ) => Promise<unknown>;
+    ) => Promise<V2Registration | void>;
   };
 };
 
-const OpenCodeClaudeBridgeV2 = {
-  async setup(ctx: V2PluginContext) {
+export type V2BridgeDeps = {
+  getClaudeTokens?: typeof getClaudeTokens;
+  refreshTokensLayered?: typeof refreshTokensLayered;
+  startOAuthCallbackServer?: typeof startOAuthCallbackServer;
+  createAuthorizationRequest?: typeof createAuthorizationRequest;
+  exchangeCodeForTokens?: typeof exchangeCodeForTokens;
+  readCachedClaudePromptCache?: typeof readCachedClaudePromptCache;
+  fetchOAuthProfile?: typeof fetchOAuthProfile;
+  configuredBaseUrl?: string;
+};
+
+const V2_SYSTEM_HOOKS = ["context", "compaction", "generate", "title"] as const;
+
+export function createOpenCodeClaudeBridgeV2(deps: V2BridgeDeps = {}) {
+  const readTokens = deps.getClaudeTokens ?? getClaudeTokens;
+  const runLayeredRefresh = deps.refreshTokensLayered ?? refreshTokensLayered;
+  const startCallback = deps.startOAuthCallbackServer ?? startOAuthCallbackServer;
+  const createAuthReq = deps.createAuthorizationRequest ?? createAuthorizationRequest;
+  const exchangeCode = deps.exchangeCodeForTokens ?? exchangeCodeForTokens;
+  const readPromptCache = deps.readCachedClaudePromptCache ?? readCachedClaudePromptCache;
+  const getProfile = deps.fetchOAuthProfile ?? fetchOAuthProfile;
+
+  return async function setup(ctx: V2PluginContext): Promise<() => Promise<void>> {
     const sessionId = SESSION_ID || randomUUID();
     const deviceId = getStableDeviceId();
-    const cachedClaudePromptCache = readCachedClaudePromptCache();
+    const cachedClaudePromptCache = readPromptCache();
     const cachedClaudeSystem = cachedClaudePromptCache?.system || null;
     const state: AnthropicRequestState = {
       sessionId,
@@ -1300,17 +1419,23 @@ const OpenCodeClaudeBridgeV2 = {
       cachedClaudePromptCache,
       cachedClaudeSystem,
     };
-    // True while the last outbound request was OAuth-rewritten; gates the
-    // response hook so API-key traffic passes through untouched (V1 parity).
-    let oauthMode = false;
-    // Per-request inbound tool-name map, computed during the request rewrite
-    // (differs from the static map when Claude schemas were injected). Keyed
-    // weakly on the rewritten Request, which the response event carries.
+
+    const registrations: V2Registration[] = [];
+    const activeServers = new Set<() => void>();
+    const track = (reg: V2Registration | void) => {
+      if (reg && typeof reg.dispose === "function") registrations.push(reg);
+    };
+
+    // One-shot token handoff used exclusively by startup keychain bootstrap so
+    // `oauth.connect` never spawns a callback server or opens a browser.
+    let bootstrapTokens: OAuthTokens | null = null;
+
+    // Per-request inbound tool-name map, computed during the request rewrite.
+    // Keyed weakly on the rewritten Request (which the response event carries),
+    // so concurrent OAuth and API-key requests never race on shared state.
     const inboundMaps = new WeakMap<Request, Record<string, string>>();
 
-    const toOAuthCredential = (
-      tokens: { access: string; refresh: string; expires: number },
-    ): V2OAuthCredential => ({
+    const toOAuthCredential = (tokens: OAuthTokens): V2OAuthCredential => ({
       type: "oauth",
       methodID: "oauth",
       access: tokens.access,
@@ -1318,259 +1443,370 @@ const OpenCodeClaudeBridgeV2 = {
       expires: tokens.expires,
     });
 
-    const isAnthropicApiUrl = (url: string): boolean => {
-      try {
-        return new URL(url).host.endsWith("anthropic.com");
-      } catch {
-        return false;
-      }
-    };
+    /**
+     * Resolve whether Anthropic is currently operating in OAuth mode and, if
+     * so, return the access token to use. Strictly returns null whenever an
+     * API key (`env` connection, `key` credential, or `x-api-key` header) is
+     * active so API-key users are never hijacked by a local Claude CLI login.
+     */
+    async function resolveAccessToken(request?: Request): Promise<string | null> {
+      const authHeader = request?.headers?.get?.("authorization");
+      const hasBearer =
+        typeof authHeader === "string" &&
+        authHeader.startsWith("Bearer ") &&
+        authHeader.length > 7;
+      const hasApiKeyHeader = Boolean(request?.headers?.get?.("x-api-key"));
 
-    // Bearer already on the request (opencode injects it from the stored
-    // credential, refreshing via the registered callback below) → stored
-    // credential → Claude CLI keychain. Never rotates refresh tokens here:
-    // Claude refresh tokens are single-use, so only the integration `refresh`
-    // callback (whose result opencode persists) may rotate them.
-    async function resolveAccessToken(request: Request): Promise<string | null> {
-      const bearer = request.headers?.get?.("authorization");
-      if (typeof bearer === "string" && bearer.startsWith("Bearer ") && bearer.length > 7) {
-        return bearer.slice(7);
-      }
+      let activeConnection: V2ConnectionInfo | undefined;
       try {
-        const connection = await ctx.integration.connection.active("anthropic");
-        if (connection) {
-          const credential = await ctx.integration.connection.resolve(connection);
+        activeConnection = await ctx.integration.connection.active("anthropic");
+      } catch {
+        activeConnection = undefined;
+      }
+
+      if (activeConnection) {
+        // Explicit env var (e.g. ANTHROPIC_API_KEY) — never hijack with OAuth.
+        if (activeConnection.type === "env") {
+          return null;
+        }
+        try {
+          const credential = await ctx.integration.connection.resolve(activeConnection);
+          if (!credential) {
+            // Credential exists but couldn't resolve — fall back to request Bearer only.
+            return hasBearer ? authHeader.slice(7) : null;
+          }
+          if (credential.type !== "oauth") {
+            // Stored API key or external credential — passthrough untouched.
+            return null;
+          }
+          if (hasBearer) {
+            return authHeader.slice(7);
+          }
           if (
-            credential?.type === "oauth" &&
             credential.access &&
-            typeof credential.expires === "number" &&
-            credential.expires > Date.now()
+            (typeof credential.expires !== "number" ||
+              credential.expires === 0 ||
+              credential.expires > Date.now())
           ) {
             return credential.access;
           }
+          return null;
+        } catch {
+          return hasBearer ? authHeader.slice(7) : null;
         }
-      } catch {}
+      }
+
+      // No active integration connection.
+      // Respect an explicit x-api-key header (e.g. custom provider config).
+      if (hasApiKeyHeader && !hasBearer) {
+        return null;
+      }
+      if (hasBearer) {
+        return authHeader.slice(7);
+      }
+
+      // Fallback when no connection or API key exists at all: read valid
+      // non-expired Claude CLI keychain tokens without rotating refresh tokens.
       try {
-        const tokens = getClaudeTokens({ refreshExpired: false });
+        const tokens = readTokens({ refreshExpired: false });
         if (tokens?.access && tokens.expires > Date.now()) return tokens.access;
       } catch {}
       return null;
     }
 
-    // ── Auth: take over the native `oauth` method on the anthropic
-    // integration so stored credentials refresh through the bridge's layered
-    // refresh instead of opencode's generic OAuth refresh.
-    await ctx.integration.transform((editor) => {
-      editor.method.update({
-        integrationID: "anthropic",
-        method: { id: "oauth", type: "oauth", label: "Claude Pro / Max (OAuth)" },
-        async authorize(): Promise<V2OAuthAuthorization> {
-          // First try: auto-bootstrap from Claude CLI keychain
-          try {
-            const tokens = getClaudeTokens({ refreshExpired: false });
-            if (tokens) {
+    // ── Auth: register the `oauth` method on the `anthropic` integration so
+    // `/connect`, startup keychain sync, and automatic refresh all go through
+    // the bridge's layered refresh and persist credentials atomically.
+    track(
+      await ctx.integration.transform((editor) => {
+        editor.method.update({
+          integrationID: "anthropic",
+          method: { id: "oauth", type: "oauth", label: "Claude Pro / Max (OAuth)" },
+          async authorize(): Promise<V2OAuthAuthorization> {
+            // 1. Startup keychain bootstrap handoff (one-shot, no browser/server)
+            if (bootstrapTokens) {
+              const tokens = bootstrapTokens;
+              bootstrapTokens = null;
               return {
                 url: "",
-                instructions:
-                  "Connected via Claude CLI keychain — no browser needed.\nIf Anthropic models aren't visible, restart OpenCode.",
+                instructions: "Connected via Claude CLI keychain.",
                 mode: "auto",
                 callback: Promise.resolve(toOAuthCredential(tokens)),
               };
             }
-          } catch {}
 
-          // Start a local HTTP server to capture the OAuth redirect. This
-          // gives us an ephemeral port so the redirect_uri is
-          // http://localhost:{port}/callback — matching Claude Code's flow.
-          let callbackServer: Awaited<
-            ReturnType<typeof startOAuthCallbackServer>
-          > | null = null;
-          try {
-            callbackServer = await startOAuthCallbackServer();
-          } catch (err) {
-            console.error(`[opencode-oauth] Failed to start callback server: ${err}`);
-          }
+            // 2. Interactive fast-path: auto-bootstrap from Claude CLI keychain
+            try {
+              const tokens = readTokens({ refreshExpired: false });
+              if (tokens) {
+                return {
+                  url: "",
+                  instructions:
+                    "Connected via Claude CLI keychain — no browser needed.",
+                  mode: "auto",
+                  callback: Promise.resolve(toOAuthCredential(tokens)),
+                };
+              }
+            } catch {}
 
-          if (callbackServer) {
-            const { url, manualUrl, verifier, port } = callbackServer;
-            const redirectUri = `http://localhost:${port}/callback`;
-            // Best-effort browser open
-            openBrowser(url);
-            // Race: localhost callback vs manual code paste. If the browser
-            // redirects to localhost, the callback server captures the code
-            // automatically; otherwise the user pastes a code from the
-            // manual-flow URL.
-            let autoCode: string | null = null;
-            callbackServer.waitForCode().then((code) => {
-              autoCode = code;
-            }).catch(() => {});
+            // 3. Localhost PKCE callback server with v2-native `mode: "auto"`
+            // and `submit` paste support (for SSH/remote environments).
+            // OpenCode's client handles opening `url`, so we do NOT invoke
+            // `openBrowser` here (avoids duplicate tabs and remote failures).
+            let callbackServer: Awaited<ReturnType<typeof startCallback>> | null = null;
+            try {
+              callbackServer = await startCallback();
+            } catch (err) {
+              console.error(`[opencode-oauth] Failed to start callback server: ${err}`);
+            }
+
+            if (callbackServer) {
+              const server = callbackServer;
+              const redirectUri = `http://localhost:${server.port}/callback`;
+              activeServers.add(server.close);
+              const callback = (async () => {
+                try {
+                  const code = await server.waitForCode();
+                  const tokens = exchangeCode(code, server.verifier, redirectUri);
+                  return toOAuthCredential(tokens);
+                } finally {
+                  activeServers.delete(server.close);
+                  server.close();
+                }
+              })();
+              return {
+                url: server.url,
+                instructions:
+                  "Complete authorization in your browser. If the redirect cannot reach this machine, paste the full redirect URL from your browser's address bar.",
+                mode: "auto",
+                callback,
+                submit: async (redirect: string) => {
+                  server.submitRedirect(redirect);
+                },
+              };
+            }
+
+            // 4. Fallback: environments where localhost binding is unavailable.
+            const { url, verifier, state: oauthState } = createAuthReq();
             return {
               url,
-              instructions: `Opening browser for OAuth...\n\nIf the browser redirected back successfully, just press Enter.\nOtherwise, open this URL and paste the code:\n${manualUrl}`,
+              instructions: `After authorizing in your browser, paste the authorization code below:\n${url}`,
               mode: "code",
-              callback: async (manualInput: string) => {
-                try {
-                  // Brief pause to let the auto-flow resolve if it just arrived
-                  if (!autoCode && !manualInput?.trim()) {
-                    await new Promise((r) => setTimeout(r, 500));
+              callback: async (rawInput: string) => {
+                const trimmed = rawInput.trim();
+                let code: string;
+                if (/^https?:\/\//i.test(trimmed)) {
+                  const parsed = parseOAuthRedirect(trimmed, oauthState);
+                  if ("error" in parsed) {
+                    throw new Error(`OAuth error: ${parsed.error}`);
                   }
-                  if (autoCode) {
-                    // Auto-flow captured the code via localhost redirect
-                    const tokens = exchangeCodeForTokens(autoCode, verifier, redirectUri);
-                    callbackServer?.close();
-                    return toOAuthCredential(tokens);
-                  }
-                  const code = parseAuthCode(manualInput);
-                  if (!code) {
-                    console.error("[opencode-oauth] No authorization code received");
-                    throw new Error("No authorization code received");
-                  }
-                  // Manual flow — redirect_uri defaults to MANUAL_REDIRECT_URL
-                  const tokens = exchangeCodeForTokens(code, verifier);
-                  callbackServer?.close();
-                  return toOAuthCredential(tokens);
-                } catch (err) {
-                  callbackServer?.close();
-                  throw err;
+                  code = parsed.code;
+                } else {
+                  code = parseAuthCode(trimmed);
                 }
+                if (!code) {
+                  throw new Error("No authorization code received");
+                }
+                return toOAuthCredential(exchangeCode(code, verifier));
               },
             };
-          }
+          },
+          async refresh(credential) {
+            // Layered refresh (keychain → stored → CLI). MUST return a promise:
+            // opencode awaits it and persists the resolved credential under a
+            // cross-process lock. Never refresh outside this callback — Claude
+            // refresh tokens are single-use.
+            const fresh = runLayeredRefresh(credential);
+            if (!fresh) {
+              throw new Error(
+                "All Claude OAuth refresh layers failed. Run `claude login` or reconnect 'Claude Pro / Max (OAuth)'.",
+              );
+            }
+            return toOAuthCredential(fresh);
+          },
+        });
+      }),
+    );
 
-          // Fallback: no callback server — use the manual redirect URL flow
-          // only (environments where we can't bind localhost).
-          const { url, verifier } = createAuthorizationRequest();
-          openBrowser(url);
-          return {
-            url,
-            instructions: `Opening browser for OAuth...\n\nAfter authorizing, you'll see a code — paste it below:\n${url}`,
-            mode: "code",
-            callback: async (code: string) =>
-              toOAuthCredential(exchangeCodeForTokens(parseAuthCode(code), verifier)),
-          };
-        },
-        async refresh(credential) {
-          // Layered refresh (keychain → stored → CLI). MUST return a promise:
-          // opencode awaits it and persists the resolved credential. Never
-          // refresh outside this callback — Claude refresh tokens are
-          // single-use.
-          const fresh = refreshTokensLayered(credential);
-          if (!fresh) {
-            throw new Error(
-              "All Claude OAuth refresh layers failed. Run `claude login` or reconnect 'Claude Pro / Max (OAuth)'.",
-            );
+    // ── Seamless zero-config keychain bootstrap ──
+    // OpenCode v2 only exposes catalog providers with at least one connection.
+    // When no Anthropic connection exists yet (neither stored credential nor
+    // ANTHROPIC_API_KEY env var) and the user already ran `claude login`,
+    // persist the keychain credential once via our registered OAuth method so
+    // Anthropic appears immediately without requiring `/connect`.
+    if (ctx.integration.oauth?.connect) {
+      try {
+        const existing = await ctx.integration.connection.active("anthropic");
+        if (!existing) {
+          const tokens = readTokens({ refreshExpired: false });
+          if (tokens) {
+            bootstrapTokens = tokens;
+            try {
+              await ctx.integration.oauth.connect({
+                integrationID: "anthropic",
+                methodID: "oauth",
+                label: "Claude CLI",
+              });
+            } finally {
+              bootstrapTokens = null;
+            }
           }
-          return toOAuthCredential(fresh);
-        },
-      });
-    });
+        }
+      } catch (err) {
+        console.error(`[opencode-claude-bridge] Keychain bootstrap skipped: ${err}`);
+      }
+    }
 
     // ── System prompt prefix (v2 replacement of
     // experimental.chat.system.transform) ──
-    await ctx.session.hook(
-      "context",
-      (event: { system: Array<{ type?: string; text?: string }> }) => {
-        if (event.system.some((s) => typeof s?.text === "string" && s.text.includes(CLAUDE_PREFIX))) return;
-        if (event.system.length > 0) {
-          event.system[0] = {
-            ...event.system[0],
-            text: `${CLAUDE_PREFIX}\n\n${event.system[0].text ?? ""}`,
-          };
-        } else {
-          event.system.push({ type: "text", text: CLAUDE_PREFIX });
-        }
-      },
-      { providerID: "anthropic" },
-    );
+    // Registered on all four session request kinds so primary turns,
+    // compaction, generate, and title requests match V1 behavior — gated on
+    // OAuth mode so API-key traffic keeps an unmodified system prompt.
+    const prependClaudePrefix = async (event: {
+      system: Array<{ type?: string; text?: string; [k: string]: unknown }>;
+    }) => {
+      if (!(await resolveAccessToken())) return;
+      if (
+        event.system.some(
+          (s) => typeof s?.text === "string" && s.text.includes(CLAUDE_PREFIX),
+        )
+      ) {
+        return;
+      }
+      if (event.system.length > 0 && event.system[0]?.type === "text") {
+        event.system[0] = {
+          ...event.system[0],
+          text: `${CLAUDE_PREFIX}\n\n${event.system[0].text ?? ""}`,
+        };
+      } else {
+        event.system.unshift({ type: "text", text: CLAUDE_PREFIX });
+      }
+    };
+
+    for (const hookName of V2_SYSTEM_HOOKS) {
+      track(
+        await ctx.session.hook(hookName, prependClaudePrefix, {
+          providerID: "anthropic",
+        }),
+      );
+    }
 
     // ── Wire rewrite (v2 replacement of the auth.loader fetch, request phase) ──
-    await ctx.session.hook(
-      "http.request",
-      async (event: { request: Request }) => {
-        const request = event.request;
-        if (!isAnthropicApiUrl(request.url)) return;
-        const accessToken = await resolveAccessToken(request);
-        if (!accessToken) {
-          oauthMode = false;
-          return; // API-key or unauthenticated — passthrough
-        }
-        oauthMode = true;
-        try {
-          // ── Headers ──
-          const headers = new Headers();
-          if (request.headers) mergeHeaders(headers, request.headers);
-          headers.set("authorization", `Bearer ${accessToken}`);
-          headers.delete("x-api-key");
-          headers.delete("x-session-affinity");
-          headers.delete("x-session-id");
-          if (!headers.has("accept")) headers.set("accept", "application/json");
-          headers.set("user-agent", USER_AGENT);
-          headers.set("x-app", "cli");
-          headers.set("x-claude-code-session-id", sessionId);
-          headers.set("anthropic-version", ANTHROPIC_VERSION);
-          headers.set("anthropic-dangerous-direct-browser-access", "true");
-          for (const [k, v] of Object.entries(STAINLESS_HEADERS)) headers.set(k, v);
-          if (!headers.has("x-stainless-retry-count")) headers.set("x-stainless-retry-count", "0");
-          if (!headers.has("x-stainless-timeout")) headers.set("x-stainless-timeout", "600");
-          headers.set("anthropic-beta", buildBetaFlags(headers.get("anthropic-beta") || ""));
+    track(
+      await ctx.session.hook(
+        "http.request",
+        async (event: { request: Request }) => {
+          const request = event.request;
+          if (!isAnthropicApiUrl(request.url, deps.configuredBaseUrl)) return;
+          const accessToken = await resolveAccessToken(request);
+          if (!accessToken) return; // API-key or unauthenticated — passthrough
 
-          // ── Body ──
-          let body: string | null = null;
-          let inboundToolNameMap = INBOUND_TOOL_NAME_MAP;
           try {
-            body = await request.text();
-          } catch {
-            body = null;
-          }
-          if (body) {
-            try {
-              const parsed = JSON.parse(body);
-              const result = await transformClaudeRequestBody(parsed, {
-                requestUrl: request.url,
-                accessToken,
-                sessionId,
-                deviceId,
-                cachedClaudePromptCache,
-                cachedClaudeSystem,
-              });
-              inboundToolNameMap = result.inboundToolNameMap;
-              body = JSON.stringify(parsed);
-            } catch {}
-          }
+            // ── Headers ──
+            const headers = new Headers();
+            if (request.headers) mergeHeaders(headers, request.headers);
+            headers.set("authorization", `Bearer ${accessToken}`);
+            headers.delete("x-api-key");
+            headers.delete("x-session-affinity");
+            headers.delete("x-session-id");
+            if (!headers.has("accept")) headers.set("accept", "application/json");
+            headers.set("user-agent", USER_AGENT);
+            headers.set("x-app", "cli");
+            headers.set("x-claude-code-session-id", sessionId);
+            headers.set("anthropic-version", ANTHROPIC_VERSION);
+            headers.set("anthropic-dangerous-direct-browser-access", "true");
+            for (const [k, v] of Object.entries(STAINLESS_HEADERS)) headers.set(k, v);
+            if (!headers.has("x-stainless-retry-count")) headers.set("x-stainless-retry-count", "0");
+            if (!headers.has("x-stainless-timeout")) headers.set("x-stainless-timeout", "600");
+            headers.set("anthropic-beta", buildBetaFlags(headers.get("anthropic-beta") || ""));
 
-          const finalUrl = normalizeAnthropicApiUrl(request.url);
-          const rewritten = new Request(finalUrl, {
-            method: request.method,
-            headers,
-            body,
-            signal: request.signal,
-          });
-          inboundMaps.set(rewritten, inboundToolNameMap);
-          event.request = rewritten;
-        } catch (err) {
-          console.error(`[opencode-claude-bridge] request rewrite failed, sending original: ${err}`);
-        }
-      },
-      { providerID: "anthropic" },
+            // ── Body ──
+            let body: string | null = null;
+            let inboundToolNameMap = INBOUND_TOOL_NAME_MAP;
+            if (request.method !== "GET" && request.method !== "HEAD") {
+              try {
+                body = await request.clone().text();
+              } catch {
+                body = null;
+              }
+            }
+            if (body) {
+              try {
+                const parsed = JSON.parse(body);
+                const profile = await getProfile(accessToken);
+                if (!parsed.metadata) parsed.metadata = {};
+                if (!parsed.metadata.user_id && profile?.account?.uuid) {
+                  parsed.metadata.user_id = JSON.stringify({
+                    device_id: state.deviceId,
+                    account_uuid: profile.account.uuid,
+                    session_id: state.sessionId,
+                  });
+                }
+                const result = await transformClaudeRequestBody(parsed, {
+                  requestUrl: request.url,
+                  accessToken: "", // profile already populated above via injectable getProfile
+                  sessionId: state.sessionId,
+                  deviceId: state.deviceId,
+                  cachedClaudePromptCache: state.cachedClaudePromptCache,
+                  cachedClaudeSystem: state.cachedClaudeSystem,
+                });
+                inboundToolNameMap = result.inboundToolNameMap;
+                body = JSON.stringify(parsed);
+              } catch {}
+            }
+
+            const finalUrl = normalizeAnthropicApiUrl(request.url);
+            const rewritten = new Request(finalUrl, {
+              method: request.method,
+              headers,
+              ...(body !== null ? { body } : {}),
+              signal: request.signal,
+            });
+            inboundMaps.set(rewritten, inboundToolNameMap);
+            event.request = rewritten;
+          } catch (err) {
+            console.error(`[opencode-claude-bridge] request rewrite failed, sending original: ${err}`);
+          }
+        },
+        { providerID: "anthropic" },
+      ),
     );
 
     // ── SSE tool-name/argument translation (response phase) ──
-    await ctx.session.hook(
-      "http.response",
-      (event: { request: Request; response: Response }) => {
-        if (!oauthMode) return;
-        const inboundToolNameMap = inboundMaps.get(event.request) ?? INBOUND_TOOL_NAME_MAP;
-        try {
-          event.response = wrapAnthropicResponseWithSse(event.response, inboundToolNameMap);
-        } catch (err) {
-          console.error(`[opencode-claude-bridge] response wrap failed: ${err}`);
-        }
-      },
-      { providerID: "anthropic" },
+    track(
+      await ctx.session.hook(
+        "http.response",
+        (event: { request: Request; response: Response }) => {
+          const inboundToolNameMap = inboundMaps.get(event.request);
+          if (!inboundToolNameMap) return; // Not OAuth-rewritten — passthrough
+          try {
+            event.response = wrapAnthropicResponseWithSse(event.response, inboundToolNameMap);
+          } catch (err) {
+            console.error(`[opencode-claude-bridge] response wrap failed: ${err}`);
+          }
+        },
+        { providerID: "anthropic" },
+      ),
     );
 
-    return () => {};
-  },
+    return async () => {
+      for (const close of activeServers) {
+        try {
+          close();
+        } catch {}
+      }
+      activeServers.clear();
+      for (const reg of registrations.splice(0).reverse()) {
+        try {
+          await reg.dispose?.();
+        } catch {}
+      }
+    };
+  };
+}
+
+const OpenCodeClaudeBridgeV2 = {
+  setup: createOpenCodeClaudeBridgeV2(),
 };
 
 /**

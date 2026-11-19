@@ -1,4 +1,4 @@
-import { randomBytes, createHash } from "node:crypto";
+import { randomBytes, createHash, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { execFileSync } from "node:child_process";
 import {
@@ -29,12 +29,57 @@ export interface OAuthCallbackServer {
   port: number;
   /** Wait for the authorization code to arrive via localhost redirect. Resolves with the code. */
   waitForCode: () => Promise<string>;
+  /**
+   * Accept a pasted redirect URL (for remote/SSH environments where the
+   * browser cannot reach localhost). Validates `state` identically to the
+   * browser callback; throws on invalid paste without aborting the attempt.
+   */
+  submitRedirect: (redirectUrl: string) => void;
   /** Stop the callback server. */
   close: () => void;
 }
 
 function base64url(buf: Buffer): string {
   return buf.toString("base64url").replace(/=+$/, "");
+}
+
+function safeEqual(a: string, b: string): boolean {
+  const bufA = Buffer.from(a, "utf8");
+  const bufB = Buffer.from(b, "utf8");
+  if (bufA.length !== bufB.length) return false;
+  return timingSafeEqual(bufA, bufB);
+}
+
+/**
+ * Validate and extract the authorization code (or OAuth error) from a pasted
+ * redirect URL, enforcing CSRF `state` equality. Throws a user-facing error
+ * if the paste is malformed, belongs to a different sign-in, or lacks a code.
+ */
+export function parseOAuthRedirect(
+  raw: string,
+  expectedState: string,
+): { code: string } | { error: string } {
+  const value = raw.trim();
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error("Paste the full URL from the browser's address bar");
+  }
+  const receivedState = parsed.searchParams.get("state");
+  if (!receivedState || !safeEqual(receivedState, expectedState)) {
+    throw new Error("This URL belongs to a different sign-in");
+  }
+  const error =
+    parsed.searchParams.get("error_description") || parsed.searchParams.get("error");
+  if (error) {
+    return { error };
+  }
+  const code = parsed.searchParams.get("code");
+  if (!code) {
+    throw new Error("The URL does not contain an authorization code");
+  }
+  return { code };
 }
 
 function sleep(ms: number): void {
@@ -142,10 +187,11 @@ function parseTokenResponse(status: number, body: string, label: string): OAuthT
  */
 function buildAuthUrls(
   port: number,
+  pkce?: { verifier: string; challenge: string; state: string },
 ): { automaticUrl: string; manualUrl: string; verifier: string; state: string } {
-  const verifier = base64url(randomBytes(64));
-  const challenge = base64url(createHash("sha256").update(verifier).digest());
-  const state = base64url(randomBytes(32));
+  const verifier = pkce?.verifier ?? base64url(randomBytes(64));
+  const challenge = pkce?.challenge ?? base64url(createHash("sha256").update(verifier).digest());
+  const state = pkce?.state ?? base64url(randomBytes(32));
 
   const automaticRedirectUri = `http://localhost:${port}/callback`;
 
@@ -181,6 +227,11 @@ function buildAuthUrls(
  */
 export function startOAuthCallbackServer(): Promise<OAuthCallbackServer> {
   return new Promise((resolve, reject) => {
+    const verifier = base64url(randomBytes(64));
+    const challenge = base64url(createHash("sha256").update(verifier).digest());
+    const state = base64url(randomBytes(32));
+
+    let settled = false;
     let codeResolve: ((code: string) => void) | null = null;
     let codeReject: ((err: Error) => void) | null = null;
     const codePromise = new Promise<string>((res, rej) => {
@@ -188,28 +239,57 @@ export function startOAuthCallbackServer(): Promise<OAuthCallbackServer> {
       codeReject = rej;
     });
 
+    const settleCode = (code: string): boolean => {
+      if (settled) return false;
+      settled = true;
+      codeResolve?.(code);
+      return true;
+    };
+
+    const settleError = (err: Error): boolean => {
+      if (settled) return false;
+      settled = true;
+      codeReject?.(err);
+      return true;
+    };
+
     const escapeHtml = (s: string) =>
       s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
     const server = createServer((req: IncomingMessage, res: ServerResponse) => {
-      const url = new URL(req.url || "/", `http://localhost`);
+      const url = new URL(req.url || "/", "http://localhost");
 
       if (url.pathname === "/callback") {
+        const receivedState = url.searchParams.get("state");
+        if (!receivedState || !safeEqual(receivedState, state)) {
+          // Reject forged/mismatched-state requests without aborting the
+          // legitimate in-flight authorization attempt.
+          res.writeHead(400, { "Content-Type": "text/html" });
+          res.end("<html><body><h2>Authorization failed</h2><p>Invalid OAuth state.</p></body></html>");
+          return;
+        }
+
+        if (settled) {
+          res.writeHead(409, { "Content-Type": "text/plain" });
+          res.end("OAuth callback already received");
+          return;
+        }
+
         const code = url.searchParams.get("code");
         const error = url.searchParams.get("error");
 
         if (error) {
           const desc = url.searchParams.get("error_description") || error;
-          res.writeHead(200, { "Content-Type": "text/html" });
+          res.writeHead(400, { "Content-Type": "text/html" });
           res.end(`<html><body><h2>Authorization failed</h2><p>${escapeHtml(desc)}</p><p>You can close this window.</p></body></html>`);
-          codeReject?.(new Error(`OAuth error: ${desc}`));
+          settleError(new Error(`OAuth error: ${desc}`));
           return;
         }
 
         if (code) {
           res.writeHead(200, { "Content-Type": "text/html" });
-          res.end(`<html><body><h2>Authorization successful</h2><p>You can close this window and return to OpenCode.</p></body></html>`);
-          codeResolve?.(code);
+          res.end("<html><body><h2>Authorization successful</h2><p>You can close this window and return to OpenCode.</p></body></html>");
+          settleCode(code);
           return;
         }
 
@@ -224,20 +304,22 @@ export function startOAuthCallbackServer(): Promise<OAuthCallbackServer> {
 
     // Timeout: close the server after 5 minutes if no code arrives
     const timeout = setTimeout(() => {
-      codeReject?.(new Error("OAuth callback timed out after 5 minutes"));
+      settleError(new Error("OAuth callback timed out after 5 minutes"));
       server.close();
     }, 5 * 60 * 1000);
+    timeout.unref?.();
 
     // Listen on port 0 = OS assigns an ephemeral port
     server.listen(0, "localhost", () => {
       const addr = server.address();
       if (!addr || typeof addr === "string") {
+        clearTimeout(timeout);
         reject(new Error("Failed to get server address"));
         return;
       }
 
       const port = addr.port;
-      const { automaticUrl, manualUrl, verifier, state } = buildAuthUrls(port);
+      const { automaticUrl, manualUrl } = buildAuthUrls(port, { verifier, challenge, state });
 
       resolve({
         url: automaticUrl,
@@ -246,6 +328,14 @@ export function startOAuthCallbackServer(): Promise<OAuthCallbackServer> {
         state,
         port,
         waitForCode: () => codePromise,
+        submitRedirect: (redirectUrl: string) => {
+          const parsed = parseOAuthRedirect(redirectUrl, state);
+          if ("error" in parsed) {
+            settleError(new Error(`OAuth error: ${parsed.error}`));
+            return;
+          }
+          settleCode(parsed.code);
+        },
         close: () => {
           clearTimeout(timeout);
           server.close();
@@ -254,6 +344,7 @@ export function startOAuthCallbackServer(): Promise<OAuthCallbackServer> {
     });
 
     server.on("error", (err) => {
+      clearTimeout(timeout);
       reject(err);
     });
   });
