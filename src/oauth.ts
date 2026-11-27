@@ -120,6 +120,18 @@ function curlPost(
     .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
     .join("&");
 
+  // Debug: log the request being sent (redacting secrets)
+  const redacted = Object.entries(body)
+    .map(([k, v]) =>
+      k.toLowerCase().includes("secret") || k.toLowerCase().includes("code")
+        ? `${k}=***REDACTED***`
+        : `${k}=${encodeURIComponent(v)}`,
+    )
+    .join("&");
+  console.error(
+    `[opencode-oauth] POST ${TOKEN_URL} ${redacted}`,
+  );
+
   for (let attempt = 0; attempt < retries; attempt++) {
     let retryDelayMs: number;
     try {
@@ -136,6 +148,13 @@ function curlPost(
       const parts = result.split("\n__HTTP_STATUS__");
       const status = parseInt(parts[parts.length - 1], 10);
       const responseBody = parts.slice(0, -1).join("\n__HTTP_STATUS__");
+
+      // Debug: log the full response body on non-200
+      if (status !== 200) {
+        console.error(
+          `[opencode-oauth] token endpoint HTTP ${status} body: ${responseBody.slice(0, 2000)}`,
+        );
+      }
 
       if (!RETRYABLE_STATUSES.has(status) || attempt === retries - 1) {
         return { status, body: responseBody };
