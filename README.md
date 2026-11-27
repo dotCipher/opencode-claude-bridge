@@ -223,6 +223,7 @@ All OAuth and header parameters can be overridden via environment variables:
 | Variable | Default | Description |
 |---|---|---|
 | `ANTHROPIC_CLIENT_ID` | `9d1c250a-...` | OAuth client ID |
+| `ANTHROPIC_CLIENT_SECRET` | — | OAuth client secret, required by Anthropic's token endpoint for confidential clients |
 | `ANTHROPIC_TOKEN_URL` | `https://platform.claude.com/v1/oauth/token` | Token endpoint |
 | `ANTHROPIC_AUTHORIZE_URL` | `https://claude.ai/oauth/authorize` | Authorization endpoint |
 | `ANTHROPIC_CLI_VERSION` | Auto-detected from `claude --version` or `2.1.98` | Claude CLI version string |

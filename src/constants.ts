@@ -35,6 +35,8 @@ export const PLUGIN_ID = "opencode-claude-bridge";
 export const CLIENT_ID =
   process.env.ANTHROPIC_CLIENT_ID || "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
+export const CLIENT_SECRET = process.env.ANTHROPIC_CLIENT_SECRET;
+
 export const PROFILE_URL =
   process.env.ANTHROPIC_PROFILE_URL ||
   "https://claude.ai/api/oauth/profile";

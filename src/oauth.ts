@@ -6,6 +6,7 @@ import { homedir, userInfo } from "node:os";
 import { dirname, join } from "node:path";
 import {
   CLIENT_ID,
+  CLIENT_SECRET,
   TOKEN_URL,
   AUTHORIZE_URL,
   MANUAL_REDIRECT_URL,
@@ -449,21 +450,25 @@ export function exchangeCodeForTokens(
   verifier: string,
   redirectUri?: string,
 ): OAuthTokens {
-  const { status, body } = curlPost({
+  const body: Record<string, string> = {
     grant_type: "authorization_code",
     code,
     code_verifier: verifier,
     client_id: CLIENT_ID,
     redirect_uri: redirectUri || MANUAL_REDIRECT_URL,
-  });
-  return parseTokenResponse(status, body, "Token exchange");
+  };
+  if (CLIENT_SECRET) body.client_secret = CLIENT_SECRET;
+  const { status, body: responseBody } = curlPost(body);
+  return parseTokenResponse(status, responseBody, "Token exchange");
 }
 
 export function refreshTokens(refreshToken: string): OAuthTokens {
-  const { status, body } = curlPost({
+  const body: Record<string, string> = {
     grant_type: "refresh_token",
     refresh_token: refreshToken,
     client_id: CLIENT_ID,
-  });
-  return parseTokenResponse(status, body, "Token refresh");
+  };
+  if (CLIENT_SECRET) body.client_secret = CLIENT_SECRET;
+  const { status, body: responseBody } = curlPost(body);
+  return parseTokenResponse(status, responseBody, "Token refresh");
 }
