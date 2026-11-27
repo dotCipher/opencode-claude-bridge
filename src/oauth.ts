@@ -96,7 +96,7 @@ export function buildTokenCurlArgs(payload: string): string[] {
     "POST",
     TOKEN_URL,
     "-H",
-    "Content-Type: application/json",
+    "Content-Type: application/x-www-form-urlencoded",
     "-H",
     `User-Agent: ${USER_AGENT}`,
     "-d",
@@ -107,12 +107,18 @@ export function buildTokenCurlArgs(payload: string): string[] {
 /**
  * curl-based token exchange to avoid Bun/runtime fetch injecting
  * forbidden headers (Origin, Referer, Sec-Fetch-*) that trigger 429s.
+ *
+ * OAuth 2.0 token endpoints (RFC 6749) require
+ * `application/x-www-form-urlencoded`, not JSON. Anthropic's token endpoint
+ * returns `400 Invalid request format` when it receives JSON.
  */
 function curlPost(
   body: Record<string, string>,
   retries = 3,
 ): { status: number; body: string } {
-  const payload = JSON.stringify(body);
+  const payload = Object.entries(body)
+    .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
+    .join("&");
 
   for (let attempt = 0; attempt < retries; attempt++) {
     let retryDelayMs: number;

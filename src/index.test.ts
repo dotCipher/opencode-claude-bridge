@@ -21,6 +21,7 @@ import {
   shouldUseClaudeToolSchemas,
 } from "./claude-tools.js";
 import {
+  buildTokenCurlArgs,
   extractOAuthErrorDetail,
   parseOAuthRedirect,
   refreshTokens,
@@ -209,6 +210,21 @@ describe("OAuth error parsing", () => {
   it("falls back to raw response bodies when parsing fails", () => {
     const detail = extractOAuthErrorDetail("plain failure body");
     assert.equal(detail, "plain failure body");
+  });
+});
+
+describe("OAuth token endpoint request format", () => {
+  it("buildTokenCurlArgs uses x-www-form-urlencoded content type", () => {
+    const args = buildTokenCurlArgs("grant_type=authorization_code&code=abc");
+    const contentTypeIndex = args.indexOf("Content-Type: application/x-www-form-urlencoded");
+    assert.ok(contentTypeIndex !== -1, "Content-Type header should be x-www-form-urlencoded");
+    assert.ok(!args.includes("application/json"), "Content-Type must not be application/json");
+  });
+
+  it("curlPost body is form-encoded, not JSON", () => {
+    const args = buildTokenCurlArgs("grant_type=refresh_token&refresh_token=abc&client_id=xyz");
+    assert.ok(args.includes("grant_type=refresh_token&refresh_token=abc&client_id=xyz"));
+    assert.ok(!args.includes('{"grant_type"'), "body must not be JSON");
   });
 });
 
