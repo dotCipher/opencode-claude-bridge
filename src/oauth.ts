@@ -1,6 +1,9 @@
 import { randomBytes, createHash, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { execFileSync } from "node:child_process";
+import { mkdirSync, appendFileSync } from "node:fs";
+import { homedir, userInfo } from "node:os";
+import { dirname, join } from "node:path";
 import {
   CLIENT_ID,
   TOKEN_URL,
@@ -10,6 +13,22 @@ import {
   USER_AGENT,
 } from "./constants.js";
 import { RETRYABLE_STATUSES, getTokenRetryDelayMs } from "./retry.js";
+
+/** Write debug info for token endpoint requests/responses to a file. */
+function logTokenDebug(label: string, data: string): void {
+  try {
+    const dataHome = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
+    const logPath = join(dataHome, "opencode", "log", "claude-bridge-oauth-debug.log");
+    mkdirSync(dirname(logPath), { recursive: true });
+    appendFileSync(
+      logPath,
+      `[${new Date().toISOString()}] ${label}\n${data}\n\n`,
+      { encoding: "utf8", mode: 0o600 },
+    );
+  } catch {
+    // Debug logging must never break the auth flow.
+  }
+}
 
 export interface OAuthTokens {
   access: string;
@@ -128,9 +147,7 @@ function curlPost(
         : `${k}=${encodeURIComponent(v)}`,
     )
     .join("&");
-  console.error(
-    `[opencode-oauth] POST ${TOKEN_URL} ${redacted}`,
-  );
+  logTokenDebug("token request", `POST ${TOKEN_URL}\n${redacted}`);
 
   for (let attempt = 0; attempt < retries; attempt++) {
     let retryDelayMs: number;
@@ -151,8 +168,9 @@ function curlPost(
 
       // Debug: log the full response body on non-200
       if (status !== 200) {
-        console.error(
-          `[opencode-oauth] token endpoint HTTP ${status} body: ${responseBody.slice(0, 2000)}`,
+        logTokenDebug(
+          "token response",
+          `HTTP ${status}\n${responseBody.slice(0, 2000)}`,
         );
       }
 
